@@ -372,11 +372,11 @@ def main():
         try:
             target_str = pd.to_datetime(sel_e).strftime("%d/%m/%Y")
             l_idx = rota[rota['Date'] == target_str].index[-1]
-            st.dataframe(rota.iloc[:l_idx+1].style.apply(highlight, axis=1), width="stretch", height=450)
-        except: st.dataframe(rota.style.apply(highlight, axis=1), width="stretch", height=450)
+            st.dataframe(rota.iloc[:l_idx+1].style.apply(highlight, axis=1), use_container_width=True, height=450)
+        except: st.dataframe(rota.style.apply(highlight, axis=1), use_container_width=True, height=450)
         
         st.subheader("Fairness Calculator for Period and YTD")
-        st.dataframe(summ, width="stretch")
+        st.dataframe(summ, use_container_width=True)
         
         out = io.BytesIO()
         with pd.ExcelWriter(out, engine='openpyxl') as writer:
