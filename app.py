@@ -98,6 +98,14 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
 
     master_a_seq = sync(hist_master_a, active_initials) if hist_master_a else active_initials.copy()
     cycle_a_schedule, b_queue = hist_cycle_a.copy(), sync(hist_b_q, active_initials)
+    
+    # --- THE FUTURE MEMORY PURGE ---
+    # Identifies the anchor Friday for the Start Date and deletes any pre-calculated cycle
+    # data on or after that date. This ensures new REQs trigger the 4-Week Forcefield properly.
+    curr_d_start = pd.to_datetime(start_date).normalize()
+    start_anc = (curr_d_start - timedelta(days=(curr_d_start.weekday() - 4) % 7)).date()
+    cycle_a_schedule = {k: v for k, v in cycle_a_schedule.items() if k < start_anc}
+
     rota_data = []
     curr_d, fin_d = pd.to_datetime(start_date).normalize(), pd.to_datetime(end_date).normalize()
     cur_a, cur_b, last_a_end = hist_curr_a, hist_curr_b, hist_last_a_dates.copy()
@@ -126,7 +134,7 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
         active_a_nights = [0, 2, 4, 5, 6] if is_bh_week else [1, 3, 4, 5, 6]
         active_b_nights = [1, 3] if is_bh_week else [0, 2]
         
-        # --- Consultant A Engine (V13: Continuous Dealing Shoe) ---
+        # --- Consultant A Engine (Continuous Dealing Shoe) ---
         if wd == 4 or cur_a is None:
             anc = curr_d - timedelta(days=(curr_d.weekday() - 4) % 7)
             if any(locum_dict.get((anc + timedelta(days=o)).date()) for o in range(7)): 
@@ -150,7 +158,7 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
                             has_wknd = any(get_leave_marker(leave_df, f + timedelta(days=o), doc) == "REQ" and (f+timedelta(days=o)).weekday() in [5,6] for o in range(7))
                             
                             is_heavy = (req_count >= 4) or (req_count >= 3 and has_wknd)
-                            if is_heavy and req_count == 7: # Only lock as base if full week requested
+                            if is_heavy and req_count == 7: 
                                 temp[f]['doc'] = doc
                                 temp[f]['locked'] = True
                                 break
@@ -176,13 +184,11 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
                         
                         assigned = False
                         attempts = 0
-                        # Try to find next unburned person (max attempts = 2 full deck lengths)
                         while not assigned and attempts < len(master_a_seq) * 2:
                             candidate = master_a_seq[deck_idx % len(master_a_seq)]
                             deck_idx += 1
                             attempts += 1
                             
-                            # If they don't have a Heavy REQ within a 4-week radius, deal them in.
                             if not has_heavy_req_nearby(candidate, f):
                                 temp[f]['doc'] = candidate
                                 assigned = True
@@ -190,7 +196,7 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
                         if not assigned:
                             temp[f]['doc'] = "UNCOVERED"
 
-                    # 5. Omnidirectional Swap Engine (Unlocked slots only)
+                    # 5. Omnidirectional Swap Engine
                     def is_valid_for_slot(doc, slot_f):
                         if doc == "UNCOVERED": return False
                         if (slot_f.date() - last_a_end.get(doc, datetime.min.date())).days < 22: return False
@@ -328,7 +334,7 @@ def main():
             st.rerun()
 
     c1, c2 = st.columns(2)
-    with c1: leave_f = st.file_uploader("Upload Leave Requests (Excel) - Optional", type=["xlsx"])
+    with c1: leave_f = st.file_uploader("Upload Previous Leave Requests (Excel) - Optional", type=["xlsx"])
     with c2: prev_f = st.file_uploader("Upload Previous Rota (Memory) - Optional", type=["xlsx"])
 
     def_s, def_e, df_l = datetime.today().date(), datetime.today().date() + timedelta(days=28), pd.DataFrame()
