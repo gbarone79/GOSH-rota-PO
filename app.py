@@ -49,7 +49,6 @@ def is_b_manual_period(dt):
     
     return m_start <= dt_safe <= m_end
 
-# --- SMART NAME DETECTOR ---
 def match_name(val, consultants):
     val = str(val).strip().upper()
     if not val or val in ['NAN', 'NONE', 'NAT', '']: return None
@@ -61,16 +60,16 @@ def match_name(val, consultants):
         if fname in val or val in fname: return ini
     return None
 
-# --- FORMAT TRANSLATOR ---
 def parse_previous_rota(uploaded_file, consultants, sel_s, ytd_s, ytd_e):
     counts = defaultdict(lambda: {"A_days": 0, "B_days": 0, "Nights": 0})
     master_a_seq, cycle_a_schedule, b_queue, curr_a, curr_b, last_a_dates = [], {}, [], None, None, {}
     hist_b_dates = {}
     prev_rota_df = None
     master_a_seq_temp = []
+    memory_leave_dict = {}
     
     if not uploaded_file: 
-        return counts, master_a_seq, cycle_a_schedule, b_queue, curr_a, curr_b, last_a_dates, hist_b_dates, prev_rota_df
+        return counts, master_a_seq, cycle_a_schedule, b_queue, curr_a, curr_b, last_a_dates, hist_b_dates, prev_rota_df, pd.DataFrame()
 
     active_initials = [str(c['Initials']).strip().upper() for c in consultants if c.get('Active', True)]
     name_map = {str(c['Initials']).strip().upper(): str(c['Full Name']).strip() for c in consultants}
@@ -86,7 +85,7 @@ def parse_previous_rota(uploaded_file, consultants, sel_s, ytd_s, ytd_e):
         
         if "Rota" in xls.sheet_names:
             df_rota = pd.read_excel(xls, sheet_name="Rota")
-            clean_rota_data = [] # We build the clean sheet from scratch
+            clean_rota_data = [] 
             
             date_col = next((c for c in df_rota.columns if str(c).strip().upper() == "DATE"), None)
             if not date_col:
@@ -109,7 +108,6 @@ def parse_previous_rota(uploaded_file, consultants, sel_s, ytd_s, ytd_e):
                         except: continue
                     else: r_date = d_val.date() if hasattr(d_val, 'date') else d_val
 
-                    # Smart Match all columns
                     a_ini = match_name(row[col_a], consultants) if col_a else None
                     b_ini = match_name(row[col_b], consultants) if col_b else None
                     n_ini = match_name(row[col_n], consultants) if col_n else None
@@ -132,7 +130,19 @@ def parse_previous_rota(uploaded_file, consultants, sel_s, ytd_s, ytd_e):
                         if n_ini:
                             hist_b_dates[n_ini] = max(hist_b_dates.get(n_ini, datetime.min.date()), r_date)
 
-                    # --- FORMAT REBUILDER: Creates the pristine new row ---
+                    # --- EXTRACT LEAVES FROM MEMORY FILE ---
+                    leave_for_date = {}
+                    for ini in active_initials:
+                        leave_val = ""
+                        for col in df_rota.columns:
+                            if str(col).strip().upper() == ini or str(col).strip().upper() == str(name_map.get(ini, "")).upper():
+                                leave_val = safe_raw(row.get(col))
+                                break
+                        leave_for_date[ini] = leave_val
+                    
+                    memory_leave_dict[pd.to_datetime(r_date)] = leave_for_date
+
+                    # --- FORMAT REBUILDER ---
                     clean_row = {
                         "Date": r_date.strftime("%d/%m/%Y"),
                         "Day": DAY_NAMES[r_date.weekday()],
@@ -141,25 +151,23 @@ def parse_previous_rota(uploaded_file, consultants, sel_s, ytd_s, ytd_e):
                         "Nights": name_map.get(n_ini, safe_raw(row.get(col_n))) if col_n else ""
                     }
                     
-                    # Scan legacy file for leave initials and perfectly map them
                     for ini in active_initials:
-                        leave_val = ""
-                        for col in df_rota.columns:
-                            if str(col).strip().upper() == ini or str(col).strip().upper() == str(name_map.get(ini, "")).upper():
-                                leave_val = safe_raw(row.get(col))
-                                break
-                        clean_row[ini] = leave_val
+                        clean_row[ini] = leave_for_date[ini]
                         
-                    # Drop entirely blank rows
-                    if clean_row["Consultant A"] or clean_row["Consultant B"] or clean_row["Nights"] or any(clean_row[i] for i in active_initials):
-                        clean_rota_data.append(clean_row)
+                    clean_rota_data.append(clean_row)
 
                 except Exception:
                     pass
             
-            # Lock the newly formatted data into the DataFrame
+            # --- EXACT TRUNCATION: Amputate rows AFTER the last worked shift ---
             if clean_rota_data:
-                prev_rota_df = pd.DataFrame(clean_rota_data)
+                df_temp = pd.DataFrame(clean_rota_data)
+                mask = (df_temp['Consultant A'] != '') | (df_temp['Consultant B'] != '') | (df_temp['Nights'] != '')
+                if mask.any():
+                    last_idx = mask[::-1].idxmax()
+                    prev_rota_df = df_temp.loc[:last_idx].copy()
+                else:
+                    prev_rota_df = pd.DataFrame()
 
         if "State" in xls.sheet_names:
             df_state = pd.read_excel(xls, sheet_name="State")
@@ -190,7 +198,8 @@ def parse_previous_rota(uploaded_file, consultants, sel_s, ytd_s, ytd_e):
     except Exception as e:
         st.warning(f"Warning: Could not fully parse the uploaded Memory file. Proceeding safely.")
         
-    return counts, master_a_seq, cycle_a_schedule, b_queue, curr_a, curr_b, last_a_dates, hist_b_dates, prev_rota_df
+    memory_leave_df = pd.DataFrame.from_dict(memory_leave_dict, orient='index') if memory_leave_dict else pd.DataFrame()
+    return counts, master_a_seq, cycle_a_schedule, b_queue, curr_a, curr_b, last_a_dates, hist_b_dates, prev_rota_df, memory_leave_df
 
 def get_leave_marker(df, d_date, ini):
     if df.empty or ini not in df.columns: return ""
@@ -576,8 +585,8 @@ def main():
             st.rerun()
 
     c1, c2 = st.columns(2)
-    with c1: leave_f = st.file_uploader("Upload Previous Leave Requests (Excel) - Optional", type=["xlsx"])
-    with c2: prev_f = st.file_uploader("Upload Previous Rota (Memory) - Optional", type=["xlsx"])
+    with c1: leave_f = st.file_uploader("Upload Separate Leave Requests - Optional", type=["xlsx"])
+    with c2: prev_f = st.file_uploader("Upload Previous Rota (Memory)", type=["xlsx"])
 
     current_year = datetime.today().year
     def_s = datetime(current_year, 1, 1).date()
@@ -603,8 +612,16 @@ def main():
     with c_y2: ytd_e = st.date_input("YTD End Date:", value=datetime(current_year, 12, 31).date(), format="DD/MM/YYYY")
     st.markdown("---")
 
-    counts, m_seq, c_sch, bq, ca, cb, h_last, hist_b_dates, prev_rota_df = parse_previous_rota(prev_f, edited_staff.to_dict('records'), sel_s, ytd_s, ytd_e) if prev_f else ({}, [], {}, [], None, None, {}, {}, None)
+    # The parser now extracts memory_leave_df directly from the Memory file
+    counts, m_seq, c_sch, bq, ca, cb, h_last, hist_b_dates, prev_rota_df, memory_leave_df = parse_previous_rota(prev_f, edited_staff.to_dict('records'), sel_s, ytd_s, ytd_e) if prev_f else ({}, [], {}, [], None, None, {}, {}, None, pd.DataFrame())
     
+    # --- AUTO-MERGE LEAVE: Use memory file leaves automatically. Separate uploaded leave overrides it. ---
+    if not memory_leave_df.empty:
+        if not df_l.empty:
+            df_l = df_l.combine_first(memory_leave_df)
+        else:
+            df_l = memory_leave_df
+
     locum_dict = {}
     for _, row in edited_locums.iterrows():
         if pd.notna(row["Start Date"]) and str(row["Locum Name"]).strip() and str(row["Locum Name"]).strip() != 'nan':
