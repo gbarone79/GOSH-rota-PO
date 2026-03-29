@@ -49,7 +49,8 @@ def is_b_manual_period(dt):
     
     return m_start <= dt_safe <= m_end
 
-def parse_previous_rota(uploaded_file, consultants):
+# --- UPDATED: Memory parser now strictly enforces Calendar YTD boundaries ---
+def parse_previous_rota(uploaded_file, consultants, sel_s):
     counts = defaultdict(lambda: {"A_days": 0, "B_days": 0, "Nights": 0})
     master_a_seq, cycle_a_schedule, b_queue, curr_a, curr_b, last_a_dates = [], {}, [], None, None, {}
     hist_b_dates = {}
@@ -61,6 +62,8 @@ def parse_previous_rota(uploaded_file, consultants):
     rev_map = {str(c['Full Name']).strip().upper(): str(c['Initials']).strip().upper() for c in consultants}
     for c in consultants:
         rev_map[str(c['Initials']).strip().upper()] = str(c['Initials']).strip().upper()
+
+    ytd_start = datetime(sel_s.year, 1, 1).date()
 
     try:
         xls = pd.ExcelFile(uploaded_file)
@@ -80,17 +83,18 @@ def parse_previous_rota(uploaded_file, consultants):
                     b_val = str(row.get("Consultant B", "")).strip().upper()
                     n_val = str(row.get("Nights", "")).strip().upper()
 
-                    if a_val in rev_map: counts[rev_map[a_val]]["A_days"] += 1
-                    
-                    if b_val in rev_map:
-                        ini = rev_map[b_val]
-                        counts[ini]["B_days"] += 1
-                        hist_b_dates[ini] = max(hist_b_dates.get(ini, datetime.min.date()), r_date)
+                    # ONLY add to YTD if the shift happened THIS year, and BEFORE the new Start Date
+                    if ytd_start <= r_date < sel_s:
+                        if a_val in rev_map: counts[rev_map[a_val]]["A_days"] += 1
+                        if b_val in rev_map: counts[rev_map[b_val]]["B_days"] += 1
+                        if n_val in rev_map: counts[rev_map[n_val]]["Nights"] += 1
                         
-                    if n_val in rev_map:
-                        ini = rev_map[n_val]
-                        counts[ini]["Nights"] += 1
-                        hist_b_dates[ini] = max(hist_b_dates.get(ini, datetime.min.date()), r_date)
+                    # Always read historical B/Night dates to ensure back-to-back penalty works across the New Year
+                    if r_date < sel_s:
+                        if b_val in rev_map:
+                            hist_b_dates[rev_map[b_val]] = max(hist_b_dates.get(rev_map[b_val], datetime.min.date()), r_date)
+                        if n_val in rev_map:
+                            hist_b_dates[rev_map[n_val]] = max(hist_b_dates.get(rev_map[n_val], datetime.min.date()), r_date)
                 except Exception:
                     pass
 
@@ -301,10 +305,7 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
         if cycle_a_schedule.get(next_fri) == doc or cycle_a_schedule.get(next_fri + timedelta(days=7)) == doc: return 1
         return 0
 
-    while curr_d <= fin_d:
-        if curr_d.month == 12 and curr_d.day == 24:
-            for i in active_initials: counts[i] = {"A_days": 0, "B_days": 0, "Nights": 0}
-            
+    while curr_d <= fin_d:            
         wd = curr_d.weekday()
         man_b = is_b_manual_period(curr_d)
         is_bh_today = uk_holidays is not None and to_date(curr_d) in uk_holidays
@@ -506,21 +507,25 @@ def main():
     with c1: leave_f = st.file_uploader("Upload Previous Leave Requests (Excel) - Optional", type=["xlsx"])
     with c2: prev_f = st.file_uploader("Upload Previous Rota (Memory) - Optional", type=["xlsx"])
 
-    def_s, def_e, df_l = datetime.today().date(), datetime.today().date() + timedelta(days=28), pd.DataFrame()
+    # --- UPDATED: Default bounds are firmly fixed to 1st Jan - 31st Dec of current year ---
+    current_year = datetime.today().year
+    def_s = datetime(current_year, 1, 1).date()
+    def_e = datetime(current_year, 12, 31).date()
+    df_l = pd.DataFrame()
+    
     if leave_f:
         try:
             df_l = pd.read_excel(leave_f); df_l.columns = [str(c).strip().upper() for c in df_l.columns]
             d_col = next((c for c in df_l.columns if "DATE" in c), df_l.columns[1])
             df_l[d_col] = pd.to_datetime(df_l[d_col], dayfirst=True, errors='coerce').dt.normalize()
             df_l = df_l.dropna(subset=[d_col]).set_index(d_col)
-            if not df_l.empty: def_s, def_e = df_l.index.min().date(), df_l.index.max().date()
         except: st.error("Error loading leave file.")
             
     col_s, col_e = st.columns(2)
     with col_s: sel_s = st.date_input("Start Rota:", value=def_s, format="DD/MM/YYYY")
     with col_e: sel_e = st.date_input("End Rota:", value=max(def_e, sel_s), min_value=sel_s, format="DD/MM/YYYY")
 
-    counts, m_seq, c_sch, bq, ca, cb, h_last, hist_b_dates, prev_rota_df = parse_previous_rota(prev_f, edited_staff.to_dict('records')) if prev_f else ({}, [], {}, [], None, None, {}, {}, None)
+    counts, m_seq, c_sch, bq, ca, cb, h_last, hist_b_dates, prev_rota_df = parse_previous_rota(prev_f, edited_staff.to_dict('records'), sel_s) if prev_f else ({}, [], {}, [], None, None, {}, {}, None)
     
     locum_dict = {}
     for _, row in edited_locums.iterrows():
@@ -557,7 +562,6 @@ def main():
         with pd.ExcelWriter(out, engine='openpyxl') as writer:
             rota.to_excel(writer, index=False, sheet_name='Rota')
             
-            # --- CLEANUP PREVIOUS ROTA ---
             if prev_rota_df is not None:
                 mask = prev_rota_df['Consultant A'].astype(str).str.strip().replace('nan', '') != ''
                 prev_rota_clean = prev_rota_df[mask].copy()
@@ -583,17 +587,14 @@ def main():
                     ws.column_dimensions[get_column_letter(i)].width = max_l + 2
                     for cell in col_cells: cell.alignment = align_left
             
-            # --- APPLY GREY HIGHLIGHTS ---
             fill = PatternFill(start_color="E5E5EA", end_color="E5E5EA", fill_type="solid")
             
-            # 1. New Rota Highlights
             ws_rota = writer.sheets['Rota']
             for i, r in enumerate(rota.itertuples(), start=2):
                 dt = pd.to_datetime(r.Date, format="%d/%m/%Y")
                 if dt.weekday() >= 5 or (uk_holidays is not None and to_date(dt) in uk_holidays):
                     for c in range(1, len(rota.columns) + 1): ws_rota.cell(row=i, column=c).fill = fill
                     
-            # 2. Previous Rota Highlights
             if prev_rota_clean is not None:
                 ws_prev = writer.sheets['Previous Period Rota']
                 for i, r in enumerate(prev_rota_clean.itertuples(), start=2):
