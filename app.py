@@ -112,13 +112,11 @@ def parse_previous_rota(uploaded_file, consultants, sel_s, ytd_s, ytd_e):
                     b_ini = match_name(row[col_b], consultants) if col_b else None
                     n_ini = match_name(row[col_n], consultants) if col_n else None
 
-                    # Score YTD tallies
                     if ytd_s <= r_date <= ytd_e and r_date < sel_s:
                         if a_ini: counts[a_ini]["A_days"] += 1
                         if b_ini: counts[b_ini]["B_days"] += 1
                         if n_ini: counts[n_ini]["Nights"] += 1
                         
-                    # Extract exact shift dates dynamically
                     if r_date < sel_s:
                         if a_ini:
                             cycle_a_schedule[r_date] = a_ini
@@ -130,7 +128,6 @@ def parse_previous_rota(uploaded_file, consultants, sel_s, ytd_s, ytd_e):
                         if n_ini:
                             hist_b_dates[n_ini] = max(hist_b_dates.get(n_ini, datetime.min.date()), r_date)
 
-                    # --- EXTRACT LEAVES FROM MEMORY FILE ---
                     leave_for_date = {}
                     for ini in active_initials:
                         leave_val = ""
@@ -142,7 +139,6 @@ def parse_previous_rota(uploaded_file, consultants, sel_s, ytd_s, ytd_e):
                     
                     memory_leave_dict[pd.to_datetime(r_date)] = leave_for_date
 
-                    # --- FORMAT REBUILDER ---
                     clean_row = {
                         "Date": r_date.strftime("%d/%m/%Y"),
                         "Day": DAY_NAMES[r_date.weekday()],
@@ -159,7 +155,6 @@ def parse_previous_rota(uploaded_file, consultants, sel_s, ytd_s, ytd_e):
                 except Exception:
                     pass
             
-            # --- EXACT TRUNCATION: Amputate rows AFTER the last worked shift ---
             if clean_rota_data:
                 df_temp = pd.DataFrame(clean_rota_data)
                 mask = (df_temp['Consultant A'] != '') | (df_temp['Consultant B'] != '') | (df_temp['Nights'] != '')
@@ -612,10 +607,8 @@ def main():
     with c_y2: ytd_e = st.date_input("YTD End Date:", value=datetime(current_year, 12, 31).date(), format="DD/MM/YYYY")
     st.markdown("---")
 
-    # The parser now extracts memory_leave_df directly from the Memory file
     counts, m_seq, c_sch, bq, ca, cb, h_last, hist_b_dates, prev_rota_df, memory_leave_df = parse_previous_rota(prev_f, edited_staff.to_dict('records'), sel_s, ytd_s, ytd_e) if prev_f else ({}, [], {}, [], None, None, {}, {}, None, pd.DataFrame())
     
-    # --- AUTO-MERGE LEAVE: Use memory file leaves automatically. Separate uploaded leave overrides it. ---
     if not memory_leave_df.empty:
         if not df_l.empty:
             df_l = df_l.combine_first(memory_leave_df)
@@ -689,11 +682,41 @@ def main():
                     
             if prev_rota_df is not None and not prev_rota_df.empty:
                 ws_prev = writer.sheets['Previous Period Rota']
+                
+                date_col_name = next((c for c in prev_rota_df.columns if str(c).strip().upper() == "DATE"), None)
+                if not date_col_name:
+                    if "Day" in prev_rota_df.columns and prev_rota_df.columns.get_loc("Day") > 0:
+                        date_col_name = prev_rota_df.columns[prev_rota_df.columns.get_loc("Day") - 1]
+                    elif len(prev_rota_df.columns) > 1:
+                        date_col_name = prev_rota_df.columns[1]
+
+                # --- DYNAMIC ROW HIDING LOGIC ---
+                threshold_date = None
+                if date_col_name:
+                    try:
+                        parsed_dates = pd.to_datetime(prev_rota_df[date_col_name], format="%d/%m/%Y", errors='coerce')
+                        max_date = parsed_dates.max()
+                        if pd.notna(max_date):
+                            threshold_date = max_date - timedelta(days=365)
+                    except: pass
+
                 for i, r in enumerate(prev_rota_df.itertuples(), start=2):
                     try:
-                        dt = pd.to_datetime(r.Date, format="%d/%m/%Y")
+                        if date_col_name and hasattr(r, date_col_name):
+                            d_val = getattr(r, date_col_name)
+                        else:
+                            d_val = r[1] if len(r) > 1 else None 
+
+                        if isinstance(d_val, str): dt = pd.to_datetime(d_val, dayfirst=True)
+                        else: dt = pd.to_datetime(d_val)
+                        
+                        # Apply gray background to weekends/holidays
                         if dt.weekday() >= 5 or (uk_holidays is not None and to_date(dt) in uk_holidays):
                             for c in range(1, len(prev_rota_df.columns) + 1): ws_prev.cell(row=i, column=c).fill = fill
+                            
+                        # Hide the row if it's older than the 12-month threshold
+                        if threshold_date and dt < threshold_date:
+                            ws_prev.row_dimensions[i].hidden = True
                     except Exception:
                         pass
         
