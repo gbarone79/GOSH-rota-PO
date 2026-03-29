@@ -49,22 +49,50 @@ def is_b_manual_period(dt):
     
     return m_start <= dt_safe <= m_end
 
-def parse_previous_rota(uploaded_file):
+def parse_previous_rota(uploaded_file, consultants):
     counts = defaultdict(lambda: {"A_days": 0, "B_days": 0, "Nights": 0})
     master_a_seq, cycle_a_schedule, b_queue, curr_a, curr_b, last_a_dates = [], {}, [], None, None, {}
+    hist_b_dates = {}
+    prev_rota_df = None
     
-    if not uploaded_file: return counts, master_a_seq, cycle_a_schedule, b_queue, curr_a, curr_b, last_a_dates
+    if not uploaded_file: 
+        return counts, master_a_seq, cycle_a_schedule, b_queue, curr_a, curr_b, last_a_dates, hist_b_dates, prev_rota_df
         
+    rev_map = {str(c['Full Name']).strip().upper(): str(c['Initials']).strip().upper() for c in consultants}
+    for c in consultants:
+        rev_map[str(c['Initials']).strip().upper()] = str(c['Initials']).strip().upper()
+
     try:
         xls = pd.ExcelFile(uploaded_file)
-        if "Summary" in xls.sheet_names:
-            df_sum = pd.read_excel(xls, sheet_name="Summary")
-            for _, row in df_sum.iterrows():
+        
+        if "Rota" in xls.sheet_names:
+            df_rota = pd.read_excel(xls, sheet_name="Rota")
+            prev_rota_df = df_rota.copy() 
+            
+            for _, row in df_rota.iterrows():
                 try:
-                    ini = str(row['Initials']).strip().upper()
-                    if ini and ini not in ['NAN', 'NONE', 'NAT']:
-                        counts[ini] = {"A_days": int(row.get('YTD A', 0)), "B_days": int(row.get('YTD B', 0)), "Nights": int(row.get('YTD Nights', 0))}
-                except Exception: pass
+                    d_val = row.get("Date")
+                    if pd.isna(d_val): continue
+                    if isinstance(d_val, str): r_date = datetime.strptime(d_val, "%d/%m/%Y").date()
+                    else: r_date = d_val.date() if hasattr(d_val, 'date') else d_val
+
+                    a_val = str(row.get("Consultant A", "")).strip().upper()
+                    b_val = str(row.get("Consultant B", "")).strip().upper()
+                    n_val = str(row.get("Nights", "")).strip().upper()
+
+                    if a_val in rev_map: counts[rev_map[a_val]]["A_days"] += 1
+                    
+                    if b_val in rev_map:
+                        ini = rev_map[b_val]
+                        counts[ini]["B_days"] += 1
+                        hist_b_dates[ini] = max(hist_b_dates.get(ini, datetime.min.date()), r_date)
+                        
+                    if n_val in rev_map:
+                        ini = rev_map[n_val]
+                        counts[ini]["Nights"] += 1
+                        hist_b_dates[ini] = max(hist_b_dates.get(ini, datetime.min.date()), r_date)
+                except Exception:
+                    pass
 
         if "State" in xls.sheet_names:
             df_state = pd.read_excel(xls, sheet_name="State")
@@ -98,7 +126,7 @@ def parse_previous_rota(uploaded_file):
     except Exception as e:
         st.warning(f"Warning: Could not fully parse the uploaded Memory file. Proceeding safely.")
         
-    return counts, master_a_seq, cycle_a_schedule, b_queue, curr_a, curr_b, last_a_dates
+    return counts, master_a_seq, cycle_a_schedule, b_queue, curr_a, curr_b, last_a_dates, hist_b_dates, prev_rota_df
 
 def get_leave_marker(df, d_date, ini):
     if df.empty or ini not in df.columns: return ""
@@ -120,12 +148,13 @@ def get_group(doc_ini):
     if doc_ini in ["GB", "OS", "CD", "TC", "TN"]: return "SOLID"
     return "UNKNOWN"
 
-def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist_master_a, hist_cycle_a, hist_b_q, hist_curr_a, hist_curr_b, hist_last_a_dates, locum_dict):
+def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist_master_a, hist_cycle_a, hist_b_q, hist_curr_a, hist_curr_b, hist_last_a_dates, locum_dict, hist_b_dates):
     active_initials = [str(c['Initials']).strip().upper() for c in consultants if c.get('Active', True)]
     name_map = {str(c['Initials']).strip().upper(): c['Full Name'] for c in consultants}
     counts = {ini: hist_counts.get(ini, {"A_days": 0, "B_days": 0, "Nights": 0}) for ini in active_initials}
     period_counts = {ini: {"A_days": 0, "B_days": 0, "Nights": 0} for ini in active_initials}
-    recent_b_shifts = {}
+    
+    recent_b_shifts = hist_b_dates.copy() 
     
     d_map = {}
     for c in consultants:
@@ -318,7 +347,6 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
                 
                 pr_a_group = get_group(pr_a)
                 
-                # --- UPDATED: DYNAMIC NIGHT FAIRNESS WITH GLOBAL TOTAL-B PROTECTOR (MONDAY QUEUE) ---
                 def sort_b_queue(q_sub):
                     if not q_sub: return q_sub
                     
@@ -329,23 +357,15 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
                         FAIRNESS_GAP = 2
                         
                         q_sub.sort(key=lambda x: (
-                            # PRIORITY 1: GLOBAL B-DAY PROTECTOR (Block if Total B is too high, regardless of nights)
                             1 if (counts[x[1]]["B_days"] - min_b_days) >= FAIRNESS_GAP else 0,
-                            # PRIORITY 2: Generic DIL Catch-Up (Only if Mon/Wed DIL AND currently below pool average)
                             0 if (d_map.get(x[1]) in ["Monday", "Wednesday"] and counts[x[1]]["Nights"] < avg_nights) else 1,
-                            # PRIORITY 3: Standard Fairness Gap for Nights
                             1 if (counts[x[1]]["Nights"] - min_nights) >= FAIRNESS_GAP else 0,
-                            # PRIORITY 4: Opposite group 
                             0 if get_group(x[1]) != pr_a_group else 1,    
-                            # PRIORITY 5: Tie-breaker on total nights
                             counts[x[1]]["Nights"],                       
-                            # PRIORITY 6: Back-to-back penalty
                             b_penalty(x[1], curr_d),                      
-                            # PRIORITY 7: Queue Position
                             x[0]                                          
                         ))
                     else:
-                        # STANDARD priority for regular days
                         min_b_days = min([counts[c]["B_days"] for c in b_queue]) if b_queue else 0
                         FAIRNESS_GAP = 2
                         q_sub.sort(key=lambda x: (
@@ -402,7 +422,6 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
                             pool = safe if safe else avail
                             a_group = get_group(da_i or cur_a)
                             
-                            # --- UPDATED: DYNAMIC NIGHT FAIRNESS WITH GLOBAL TOTAL-B PROTECTOR (MID-WEEK POOL) ---
                             if wd in active_b_nights:
                                 avg_nights = sum(counts[c]["Nights"] for c in pool) / len(pool) if pool else 0
                                 min_nights = min([counts[c]["Nights"] for c in pool]) if pool else 0
@@ -410,21 +429,14 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
                                 FAIRNESS_GAP = 2
                                 
                                 best = min(pool, key=lambda x: (
-                                    # PRIORITY 1: GLOBAL B-DAY PROTECTOR (Block if Total B is too high)
                                     1 if (counts[x]["B_days"] - min_b_days) >= FAIRNESS_GAP else 0,
-                                    # PRIORITY 2: Generic DIL Catch-Up (Only if Mon/Wed DIL AND currently below pool average)
                                     0 if (d_map.get(x) in ["Monday", "Wednesday"] and counts[x]["Nights"] < avg_nights) else 1,
-                                    # PRIORITY 3: Standard Fairness Gap
                                     1 if (counts[x]["Nights"] - min_nights) >= FAIRNESS_GAP else 0,
-                                    # PRIORITY 4: Opposite group
                                     0 if get_group(x) != a_group else 1,      
-                                    # PRIORITY 5: Tie-breaker on total nights
                                     counts[x]["Nights"],                      
-                                    # PRIORITY 6: Back-to-back penalty
                                     b_penalty(x, curr_d)                      
                                 ))
                             else:
-                                # STANDARD priority for regular days
                                 min_b_days = min([counts[c]["B_days"] for c in pool]) if pool else 0
                                 FAIRNESS_GAP = 2
                                 best = min(pool, key=lambda x: (
@@ -508,7 +520,7 @@ def main():
     with col_s: sel_s = st.date_input("Start Rota:", value=def_s, format="DD/MM/YYYY")
     with col_e: sel_e = st.date_input("End Rota:", value=max(def_e, sel_s), min_value=sel_s, format="DD/MM/YYYY")
 
-    counts, m_seq, c_sch, bq, ca, cb, h_last = parse_previous_rota(prev_f) if prev_f else ({}, [], {}, [], None, None, {})
+    counts, m_seq, c_sch, bq, ca, cb, h_last, hist_b_dates, prev_rota_df = parse_previous_rota(prev_f, edited_staff.to_dict('records')) if prev_f else ({}, [], {}, [], None, None, {}, {}, None)
     
     locum_dict = {}
     for _, row in edited_locums.iterrows():
@@ -521,11 +533,11 @@ def main():
                 c += timedelta(days=1)
 
     if st.button("Generate Final Rota", type="primary"):
-        rota, summ, state = generate_rota(df_l, edited_staff.to_dict('records'), sel_s, sel_e, counts, m_seq, c_sch, bq, ca, cb, h_last, locum_dict)
-        st.session_state.rota_result = (rota, summ, state, sel_e)
+        rota, summ, state = generate_rota(df_l, edited_staff.to_dict('records'), sel_s, sel_e, counts, m_seq, c_sch, bq, ca, cb, h_last, locum_dict, hist_b_dates)
+        st.session_state.rota_result = (rota, summ, state, sel_e, prev_rota_df)
 
     if st.session_state.rota_result:
-        rota, summ, state, sel_e = st.session_state.rota_result
+        rota, summ, state, sel_e, prev_rota_df = st.session_state.rota_result
         def highlight(row):
             dt = pd.to_datetime(row['Date'], format="%d/%m/%Y")
             if dt.weekday() >= 5 or (uk_holidays is not None and to_date(dt) in uk_holidays): return ['background-color: #e5e5ea;'] * len(row)
@@ -544,25 +556,56 @@ def main():
         out = io.BytesIO()
         with pd.ExcelWriter(out, engine='openpyxl') as writer:
             rota.to_excel(writer, index=False, sheet_name='Rota')
+            
+            # --- CLEANUP PREVIOUS ROTA ---
+            if prev_rota_df is not None:
+                mask = prev_rota_df['Consultant A'].astype(str).str.strip().replace('nan', '') != ''
+                prev_rota_clean = prev_rota_df[mask].copy()
+                prev_rota_clean.to_excel(writer, index=False, sheet_name='Previous Period Rota')
+            else:
+                prev_rota_clean = None
+                
             summ.to_excel(writer, index=False, sheet_name='Summary')
             pd.DataFrame(list(state.items()), columns=["Key", "Value"]).to_excel(writer, index=False, sheet_name='State')
             pd.DataFrame([["AL", "Annual Leave"], ["SL", "Study Leave"], ["OFF", "Off for other reasons"], ["NO", "Please do not put me on call"], ["REQ", "Please add me on this week"]], columns=["Marker", "Description"]).to_excel(writer, index=False, sheet_name='Legend')
             
-            ws = writer.sheets['Rota']
-            ws.freeze_panes = "C2"
-            align_left = Alignment(horizontal='left', vertical='center')
-            for i, col_cells in enumerate(ws.columns, 1):
-                col_name = ws.cell(row=1, column=i).value
-                vals = [len(str(cell.value)) for cell in col_cells if cell.value]
-                max_l = max(vals + [len(str(col_name)) if col_name else 5])
-                ws.column_dimensions[get_column_letter(i)].width = max_l + 2
-                for cell in col_cells: cell.alignment = align_left
+            sheets_to_format = ['Rota']
+            if prev_rota_clean is not None: sheets_to_format.append('Previous Period Rota')
+                
+            for s_name in sheets_to_format:
+                ws = writer.sheets[s_name]
+                ws.freeze_panes = "C2"
+                align_left = Alignment(horizontal='left', vertical='center')
+                for i, col_cells in enumerate(ws.columns, 1):
+                    col_name = ws.cell(row=1, column=i).value
+                    vals = [len(str(cell.value)) for cell in col_cells if cell.value]
+                    max_l = max(vals + [len(str(col_name)) if col_name else 5])
+                    ws.column_dimensions[get_column_letter(i)].width = max_l + 2
+                    for cell in col_cells: cell.alignment = align_left
             
+            # --- APPLY GREY HIGHLIGHTS ---
             fill = PatternFill(start_color="E5E5EA", end_color="E5E5EA", fill_type="solid")
+            
+            # 1. New Rota Highlights
+            ws_rota = writer.sheets['Rota']
             for i, r in enumerate(rota.itertuples(), start=2):
                 dt = pd.to_datetime(r.Date, format="%d/%m/%Y")
                 if dt.weekday() >= 5 or (uk_holidays is not None and to_date(dt) in uk_holidays):
-                    for c in range(1, len(rota.columns) + 1): ws.cell(row=i, column=c).fill = fill
+                    for c in range(1, len(rota.columns) + 1): ws_rota.cell(row=i, column=c).fill = fill
+                    
+            # 2. Previous Rota Highlights
+            if prev_rota_clean is not None:
+                ws_prev = writer.sheets['Previous Period Rota']
+                for i, r in enumerate(prev_rota_clean.itertuples(), start=2):
+                    try:
+                        d_val = r.Date
+                        if isinstance(d_val, str): dt = pd.to_datetime(d_val, format="%d/%m/%Y")
+                        else: dt = pd.to_datetime(d_val)
+                        
+                        if dt.weekday() >= 5 or (uk_holidays is not None and to_date(dt) in uk_holidays):
+                            for c in range(1, len(prev_rota_clean.columns) + 1): ws_prev.cell(row=i, column=c).fill = fill
+                    except Exception:
+                        pass
         
         st.download_button("Download Rota", out.getvalue(), f"Rota_{datetime.now().strftime('%d_%m')}.xlsx", type="primary")
 
