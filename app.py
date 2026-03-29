@@ -49,6 +49,7 @@ def is_b_manual_period(dt):
     
     return m_start <= dt_safe <= m_end
 
+# --- SMART NAME DETECTOR ---
 def match_name(val, consultants):
     val = str(val).strip().upper()
     if not val or val in ['NAN', 'NONE', 'NAT', '']: return None
@@ -60,6 +61,7 @@ def match_name(val, consultants):
         if fname in val or val in fname: return ini
     return None
 
+# --- FORMAT TRANSLATOR ---
 def parse_previous_rota(uploaded_file, consultants, sel_s, ytd_s, ytd_e):
     counts = defaultdict(lambda: {"A_days": 0, "B_days": 0, "Nights": 0})
     master_a_seq, cycle_a_schedule, b_queue, curr_a, curr_b, last_a_dates = [], {}, [], None, None, {}
@@ -72,9 +74,6 @@ def parse_previous_rota(uploaded_file, consultants, sel_s, ytd_s, ytd_e):
 
     active_initials = [str(c['Initials']).strip().upper() for c in consultants if c.get('Active', True)]
     name_map = {str(c['Initials']).strip().upper(): str(c['Full Name']).strip() for c in consultants}
-    rev_map = {str(c['Full Name']).strip().upper(): str(c['Initials']).strip().upper() for c in consultants}
-    for c in consultants:
-        rev_map[str(c['Initials']).strip().upper()] = str(c['Initials']).strip().upper()
 
     def safe_raw(val):
         if pd.isna(val): return ""
@@ -87,7 +86,7 @@ def parse_previous_rota(uploaded_file, consultants, sel_s, ytd_s, ytd_e):
         
         if "Rota" in xls.sheet_names:
             df_rota = pd.read_excel(xls, sheet_name="Rota")
-            clean_rota_data = []
+            clean_rota_data = [] # We build the clean sheet from scratch
             
             date_col = next((c for c in df_rota.columns if str(c).strip().upper() == "DATE"), None)
             if not date_col:
@@ -110,15 +109,18 @@ def parse_previous_rota(uploaded_file, consultants, sel_s, ytd_s, ytd_e):
                         except: continue
                     else: r_date = d_val.date() if hasattr(d_val, 'date') else d_val
 
+                    # Smart Match all columns
                     a_ini = match_name(row[col_a], consultants) if col_a else None
                     b_ini = match_name(row[col_b], consultants) if col_b else None
                     n_ini = match_name(row[col_n], consultants) if col_n else None
 
+                    # Score YTD tallies
                     if ytd_s <= r_date <= ytd_e and r_date < sel_s:
                         if a_ini: counts[a_ini]["A_days"] += 1
                         if b_ini: counts[b_ini]["B_days"] += 1
                         if n_ini: counts[n_ini]["Nights"] += 1
                         
+                    # Extract exact shift dates dynamically
                     if r_date < sel_s:
                         if a_ini:
                             cycle_a_schedule[r_date] = a_ini
@@ -130,7 +132,7 @@ def parse_previous_rota(uploaded_file, consultants, sel_s, ytd_s, ytd_e):
                         if n_ini:
                             hist_b_dates[n_ini] = max(hist_b_dates.get(n_ini, datetime.min.date()), r_date)
 
-                    # --- FORMAT TRANSLATOR: Standardizing the old rows ---
+                    # --- FORMAT REBUILDER: Creates the pristine new row ---
                     clean_row = {
                         "Date": r_date.strftime("%d/%m/%Y"),
                         "Day": DAY_NAMES[r_date.weekday()],
@@ -139,19 +141,23 @@ def parse_previous_rota(uploaded_file, consultants, sel_s, ytd_s, ytd_e):
                         "Nights": name_map.get(n_ini, safe_raw(row.get(col_n))) if col_n else ""
                     }
                     
+                    # Scan legacy file for leave initials and perfectly map them
                     for ini in active_initials:
                         leave_val = ""
                         for col in df_rota.columns:
-                            if str(col).strip().upper() == ini:
+                            if str(col).strip().upper() == ini or str(col).strip().upper() == str(name_map.get(ini, "")).upper():
                                 leave_val = safe_raw(row.get(col))
                                 break
                         clean_row[ini] = leave_val
                         
-                    clean_rota_data.append(clean_row)
+                    # Drop entirely blank rows
+                    if clean_row["Consultant A"] or clean_row["Consultant B"] or clean_row["Nights"] or any(clean_row[i] for i in active_initials):
+                        clean_rota_data.append(clean_row)
 
                 except Exception:
                     pass
             
+            # Lock the newly formatted data into the DataFrame
             if clean_rota_data:
                 prev_rota_df = pd.DataFrame(clean_rota_data)
 
@@ -167,6 +173,14 @@ def parse_previous_rota(uploaded_file, consultants, sel_s, ytd_s, ytd_e):
                 b_queue = [x.strip().upper() for x in s_str("B_QUEUE").split(",") if x.strip()]
                 curr_a = s_str("CURRENT_A") or None
                 curr_b = s_str("CURRENT_B") or None
+                
+                last_a_str = s_str("LAST_A_END_DATES")
+                if last_a_str:
+                    for item in last_a_str.split(","):
+                        if ":" in item:
+                            k, d = item.split(":")
+                            try: last_a_dates[k.strip()] = datetime.strptime(d.strip(), '%Y-%m-%d').date()
+                            except ValueError: pass
                 
         if not master_a_seq and master_a_seq_temp:
             seen = set()
@@ -626,28 +640,16 @@ def main():
         with pd.ExcelWriter(out, engine='openpyxl') as writer:
             rota.to_excel(writer, index=False, sheet_name='Rota')
             
-            # --- The Format Translator naturally standardizes prev_rota_df, making this export perfectly clean ---
             if prev_rota_df is not None and not prev_rota_df.empty:
-                c_a = prev_rota_df.get('Consultant A', pd.Series('', index=prev_rota_df.index)).astype(str).str.strip().str.upper().replace(['NAN', 'NONE', 'NAT'], '')
-                c_b = prev_rota_df.get('Consultant B', pd.Series('', index=prev_rota_df.index)).astype(str).str.strip().str.upper().replace(['NAN', 'NONE', 'NAT'], '')
-                c_n = prev_rota_df.get('Nights', pd.Series('', index=prev_rota_df.index)).astype(str).str.strip().str.upper().replace(['NAN', 'NONE', 'NAT'], '')
-                
-                mask = (c_a != '') | (c_b != '') | (c_n != '')
-                if isinstance(mask, pd.Series) and len(mask) == len(prev_rota_df):
-                    prev_rota_clean = prev_rota_df[mask].copy()
-                else:
-                    prev_rota_clean = prev_rota_df.copy()
-                
-                prev_rota_clean.to_excel(writer, index=False, sheet_name='Previous Period Rota')
-            else:
-                prev_rota_clean = None
+                prev_rota_df.to_excel(writer, index=False, sheet_name='Previous Period Rota')
                 
             summ.to_excel(writer, index=False, sheet_name='Summary')
             pd.DataFrame(list(state.items()), columns=["Key", "Value"]).to_excel(writer, index=False, sheet_name='State')
             pd.DataFrame([["AL", "Annual Leave"], ["SL", "Study Leave"], ["OFF", "Off for other reasons"], ["NO", "Please do not put me on call"], ["REQ", "Please add me on this week"]], columns=["Marker", "Description"]).to_excel(writer, index=False, sheet_name='Legend')
             
             sheets_to_format = ['Rota']
-            if prev_rota_clean is not None: sheets_to_format.append('Previous Period Rota')
+            if prev_rota_df is not None and not prev_rota_df.empty:
+                sheets_to_format.append('Previous Period Rota')
                 
             for s_name in sheets_to_format:
                 ws = writer.sheets[s_name]
@@ -668,13 +670,13 @@ def main():
                 if dt.weekday() >= 5 or (uk_holidays is not None and to_date(dt) in uk_holidays):
                     for c in range(1, len(rota.columns) + 1): ws_rota.cell(row=i, column=c).fill = fill
                     
-            if prev_rota_clean is not None:
+            if prev_rota_df is not None and not prev_rota_df.empty:
                 ws_prev = writer.sheets['Previous Period Rota']
-                for i, r in enumerate(prev_rota_clean.itertuples(), start=2):
+                for i, r in enumerate(prev_rota_df.itertuples(), start=2):
                     try:
                         dt = pd.to_datetime(r.Date, format="%d/%m/%Y")
                         if dt.weekday() >= 5 or (uk_holidays is not None and to_date(dt) in uk_holidays):
-                            for c in range(1, len(prev_rota_clean.columns) + 1): ws_prev.cell(row=i, column=c).fill = fill
+                            for c in range(1, len(prev_rota_df.columns) + 1): ws_prev.cell(row=i, column=c).fill = fill
                     except Exception:
                         pass
         
