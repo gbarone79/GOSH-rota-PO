@@ -49,8 +49,7 @@ def is_b_manual_period(dt):
     
     return m_start <= dt_safe <= m_end
 
-# --- UPDATED: Memory parser now strictly enforces Calendar YTD boundaries ---
-def parse_previous_rota(uploaded_file, consultants, sel_s):
+def parse_previous_rota(uploaded_file, consultants, sel_s, ytd_s, ytd_e):
     counts = defaultdict(lambda: {"A_days": 0, "B_days": 0, "Nights": 0})
     master_a_seq, cycle_a_schedule, b_queue, curr_a, curr_b, last_a_dates = [], {}, [], None, None, {}
     hist_b_dates = {}
@@ -63,12 +62,11 @@ def parse_previous_rota(uploaded_file, consultants, sel_s):
     for c in consultants:
         rev_map[str(c['Initials']).strip().upper()] = str(c['Initials']).strip().upper()
 
-    ytd_start = datetime(sel_s.year, 1, 1).date()
-
     try:
         xls = pd.ExcelFile(uploaded_file)
         
         if "Rota" in xls.sheet_names:
+            # THIS CREATES THE PURE ARCHIVE COPY
             df_rota = pd.read_excel(xls, sheet_name="Rota")
             prev_rota_df = df_rota.copy() 
             
@@ -83,13 +81,11 @@ def parse_previous_rota(uploaded_file, consultants, sel_s):
                     b_val = str(row.get("Consultant B", "")).strip().upper()
                     n_val = str(row.get("Nights", "")).strip().upper()
 
-                    # ONLY add to YTD if the shift happened THIS year, and BEFORE the new Start Date
-                    if ytd_start <= r_date < sel_s:
+                    if ytd_s <= r_date <= ytd_e and r_date < sel_s:
                         if a_val in rev_map: counts[rev_map[a_val]]["A_days"] += 1
                         if b_val in rev_map: counts[rev_map[b_val]]["B_days"] += 1
                         if n_val in rev_map: counts[rev_map[n_val]]["Nights"] += 1
                         
-                    # Always read historical B/Night dates to ensure back-to-back penalty works across the New Year
                     if r_date < sel_s:
                         if b_val in rev_map:
                             hist_b_dates[rev_map[b_val]] = max(hist_b_dates.get(rev_map[b_val], datetime.min.date()), r_date)
@@ -152,7 +148,7 @@ def get_group(doc_ini):
     if doc_ini in ["GB", "OS", "CD", "TC", "TN"]: return "SOLID"
     return "UNKNOWN"
 
-def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist_master_a, hist_cycle_a, hist_b_q, hist_curr_a, hist_curr_b, hist_last_a_dates, locum_dict, hist_b_dates):
+def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist_master_a, hist_cycle_a, hist_b_q, hist_curr_a, hist_curr_b, hist_last_a_dates, locum_dict, hist_b_dates, ytd_s, ytd_e):
     active_initials = [str(c['Initials']).strip().upper() for c in consultants if c.get('Active', True)]
     name_map = {str(c['Initials']).strip().upper(): c['Full Name'] for c in consultants}
     counts = {ini: hist_counts.get(ini, {"A_days": 0, "B_days": 0, "Nights": 0}) for ini in active_initials}
@@ -305,6 +301,12 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
         if cycle_a_schedule.get(next_fri) == doc or cycle_a_schedule.get(next_fri + timedelta(days=7)) == doc: return 1
         return 0
 
+    def add_score(doc_ini, s_type, d_date):
+        if doc_ini and doc_ini in period_counts:
+            period_counts[doc_ini][s_type] += 1
+            if ytd_s <= to_date(d_date) <= ytd_e:
+                counts[doc_ini][s_type] += 1
+
     while curr_d <= fin_d:            
         wd = curr_d.weekday()
         man_b = is_b_manual_period(curr_d)
@@ -330,7 +332,8 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
                 if cur_a not in ["UNCOVERED", "LOCUM_ACADEMIC"] and not is_clean(cur_a, anc): 
                     cur_a = "UNCOVERED"
 
-        if wd == 0 or cur_b is None:
+        # --- FIX: Safe wakeup from "MANUAL ENTRY" mid-week ---
+        if wd == 0 or cur_b is None or cur_b == "MANUAL ENTRY":
             if man_b:
                 cur_b = "MANUAL ENTRY"
             else:
@@ -397,10 +400,10 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
         else: da_n, da_i = name_map.get(cur_a, cur_a), (cur_a if cur_a not in ["UNCOVERED", "LOCUM_ACADEMIC", "MANUAL ENTRY"] else None)
 
         row = {"Date": curr_d.strftime("%d/%m/%Y"), "Day": DAY_NAMES[wd], "Consultant A": da_n, "Consultant B": "", "Nights": ""}
-        if da_i: counts[da_i]["A_days"] += 1; period_counts[da_i]["A_days"] += 1
+        if da_i: add_score(da_i, "A_days", curr_d)
         if wd in active_a_nights: 
             row["Nights"] = da_n
-            if da_i: counts[da_i]["Nights"] += 1; period_counts[da_i]["Nights"] += 1
+            if da_i: add_score(da_i, "Nights", curr_d)
 
         if wd in B_WORK_DAYS:
             if is_bh_today:
@@ -410,7 +413,7 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
                     else:
                         b_night_name = name_map.get(cur_b, "UNCOVERED")
                         row["Nights"] = b_night_name
-                        if cur_b: counts[cur_b]["Nights"] += 1; period_counts[cur_b]["Nights"] += 1
+                        if cur_b: add_score(cur_b, "Nights", curr_d)
             else:
                 if man_b:
                     row["Consultant B"] = "MANUAL ENTRY"
@@ -448,18 +451,18 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
                                 ))
                             
                             row["Consultant B"] = name_map.get(best)
-                            counts[best]["B_days"] += 1; period_counts[best]["B_days"] += 1
+                            add_score(best, "B_days", curr_d)
                             recent_b_shifts[best] = to_date(curr_d)   
                         else: row["Consultant B"] = "UNCOVERED"
                     else: 
                         row["Consultant B"] = name_map.get(cur_b, "UNCOVERED")
-                        counts[cur_b]["B_days"] += 1; period_counts[cur_b]["B_days"] += 1
-                        recent_b_shifts[cur_b] = to_date(curr_d)      
+                        add_score(cur_b, "B_days", curr_d)
+                        if cur_b and cur_b in period_counts: recent_b_shifts[cur_b] = to_date(curr_d)      
                     
                     if wd in active_b_nights:
                         row["Nights"] = row["Consultant B"]
                         b_i = next((k for k, v in name_map.items() if v == row["Consultant B"]), None)
-                        if b_i: counts[b_i]["Nights"] += 1; period_counts[b_i]["Nights"] += 1
+                        if b_i: add_score(b_i, "Nights", curr_d)
 
         for i in active_initials: row[i] = get_eff_marker(curr_d, i)
         if da_i: last_a_end[da_i] = to_date(curr_d)
@@ -507,7 +510,6 @@ def main():
     with c1: leave_f = st.file_uploader("Upload Previous Leave Requests (Excel) - Optional", type=["xlsx"])
     with c2: prev_f = st.file_uploader("Upload Previous Rota (Memory) - Optional", type=["xlsx"])
 
-    # --- UPDATED: Default bounds are firmly fixed to 1st Jan - 31st Dec of current year ---
     current_year = datetime.today().year
     def_s = datetime(current_year, 1, 1).date()
     def_e = datetime(current_year, 12, 31).date()
@@ -520,12 +522,19 @@ def main():
             df_l[d_col] = pd.to_datetime(df_l[d_col], dayfirst=True, errors='coerce').dt.normalize()
             df_l = df_l.dropna(subset=[d_col]).set_index(d_col)
         except: st.error("Error loading leave file.")
-            
-    col_s, col_e = st.columns(2)
-    with col_s: sel_s = st.date_input("Start Rota:", value=def_s, format="DD/MM/YYYY")
-    with col_e: sel_e = st.date_input("End Rota:", value=max(def_e, sel_s), min_value=sel_s, format="DD/MM/YYYY")
 
-    counts, m_seq, c_sch, bq, ca, cb, h_last, hist_b_dates, prev_rota_df = parse_previous_rota(prev_f, edited_staff.to_dict('records'), sel_s) if prev_f else ({}, [], {}, [], None, None, {}, {}, None)
+    st.markdown("---")
+    st.subheader("🗓️ Calendar & Fairness Settings")
+    st.markdown("<p style='color:#86868b; font-size:14px;'>Set the exact dates for your new schedule, and verify the dates you want to track for total fairness balancing.</p>", unsafe_allow_html=True)
+    
+    c_p1, c_p2, c_y1, c_y2 = st.columns(4)
+    with c_p1: sel_s = st.date_input("Start New Rota:", value=def_s, format="DD/MM/YYYY")
+    with c_p2: sel_e = st.date_input("End New Rota:", value=max(def_e, sel_s), min_value=sel_s, format="DD/MM/YYYY")
+    with c_y1: ytd_s = st.date_input("YTD Start Date:", value=datetime(current_year, 1, 1).date(), format="DD/MM/YYYY")
+    with c_y2: ytd_e = st.date_input("YTD End Date:", value=datetime(current_year, 12, 31).date(), format="DD/MM/YYYY")
+    st.markdown("---")
+
+    counts, m_seq, c_sch, bq, ca, cb, h_last, hist_b_dates, prev_rota_df = parse_previous_rota(prev_f, edited_staff.to_dict('records'), sel_s, ytd_s, ytd_e) if prev_f else ({}, [], {}, [], None, None, {}, {}, None)
     
     locum_dict = {}
     for _, row in edited_locums.iterrows():
@@ -538,7 +547,7 @@ def main():
                 c += timedelta(days=1)
 
     if st.button("Generate Final Rota", type="primary"):
-        rota, summ, state = generate_rota(df_l, edited_staff.to_dict('records'), sel_s, sel_e, counts, m_seq, c_sch, bq, ca, cb, h_last, locum_dict, hist_b_dates)
+        rota, summ, state = generate_rota(df_l, edited_staff.to_dict('records'), sel_s, sel_e, counts, m_seq, c_sch, bq, ca, cb, h_last, locum_dict, hist_b_dates, ytd_s, ytd_e)
         st.session_state.rota_result = (rota, summ, state, sel_e, prev_rota_df)
 
     if st.session_state.rota_result:
@@ -548,22 +557,27 @@ def main():
             if dt.weekday() >= 5 or (uk_holidays is not None and to_date(dt) in uk_holidays): return ['background-color: #e5e5ea;'] * len(row)
             return [''] * len(row)
         
-        st.subheader("Rota for the Period")
+        st.subheader("Rota for the Selected Period")
         try:
             target_str = pd.to_datetime(sel_e).strftime("%d/%m/%Y")
             l_idx = rota[rota['Date'] == target_str].index[-1]
             st.dataframe(rota.iloc[:l_idx+1].style.apply(highlight, axis=1), use_container_width=True, height=450)
         except: st.dataframe(rota.style.apply(highlight, axis=1), use_container_width=True, height=450)
         
-        st.subheader("Fairness Calculator for Period and YTD")
+        st.subheader("Fairness Calculator")
         st.dataframe(summ, use_container_width=True)
         
         out = io.BytesIO()
         with pd.ExcelWriter(out, engine='openpyxl') as writer:
             rota.to_excel(writer, index=False, sheet_name='Rota')
             
+            # --- PURE ARCHIVE: Copy memory file exactly, filtering only the blank padding rows ---
             if prev_rota_df is not None:
-                mask = prev_rota_df['Consultant A'].astype(str).str.strip().replace('nan', '') != ''
+                c_a = prev_rota_df.get('Consultant A', pd.Series(dtype=str)).astype(str).str.strip().str.upper().replace(['NAN', 'NONE', 'NAT'], '')
+                c_b = prev_rota_df.get('Consultant B', pd.Series(dtype=str)).astype(str).str.strip().str.upper().replace(['NAN', 'NONE', 'NAT'], '')
+                c_n = prev_rota_df.get('Nights', pd.Series(dtype=str)).astype(str).str.strip().str.upper().replace(['NAN', 'NONE', 'NAT'], '')
+                
+                mask = (c_a != '') | (c_b != '') | (c_n != '')
                 prev_rota_clean = prev_rota_df[mask].copy()
                 prev_rota_clean.to_excel(writer, index=False, sheet_name='Previous Period Rota')
             else:
