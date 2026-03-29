@@ -66,10 +66,11 @@ def parse_previous_rota(uploaded_file, consultants, sel_s, ytd_s, ytd_e):
     master_a_seq, cycle_a_schedule, b_queue, curr_a, curr_b, last_a_dates = [], {}, [], None, None, {}
     hist_b_dates = {}
     prev_rota_df = None
+    master_a_seq_temp = []
     
     if not uploaded_file: 
         return counts, master_a_seq, cycle_a_schedule, b_queue, curr_a, curr_b, last_a_dates, hist_b_dates, prev_rota_df
-        
+
     try:
         xls = pd.ExcelFile(uploaded_file)
         
@@ -98,22 +99,32 @@ def parse_previous_rota(uploaded_file, consultants, sel_s, ytd_s, ytd_e):
                         except: continue
                     else: r_date = d_val.date() if hasattr(d_val, 'date') else d_val
 
-                    # Use the Smart Name Detector
+                    # Smart Match all columns
                     a_ini = match_name(row[col_a], consultants) if col_a else None
                     b_ini = match_name(row[col_b], consultants) if col_b else None
                     n_ini = match_name(row[col_n], consultants) if col_n else None
 
+                    # Score YTD tallies
                     if ytd_s <= r_date <= ytd_e and r_date < sel_s:
                         if a_ini: counts[a_ini]["A_days"] += 1
                         if b_ini: counts[b_ini]["B_days"] += 1
                         if n_ini: counts[n_ini]["Nights"] += 1
                         
+                    # --- DEEP HISTORY SCAN: Extract exact shift dates dynamically ---
                     if r_date < sel_s:
-                        if b_ini: hist_b_dates[b_ini] = max(hist_b_dates.get(b_ini, datetime.min.date()), r_date)
-                        if n_ini: hist_b_dates[n_ini] = max(hist_b_dates.get(n_ini, datetime.min.date()), r_date)
+                        if a_ini:
+                            cycle_a_schedule[r_date] = a_ini
+                            last_a_dates[a_ini] = max(last_a_dates.get(a_ini, datetime.min.date()), r_date)
+                            if not master_a_seq_temp or master_a_seq_temp[-1] != a_ini:
+                                master_a_seq_temp.append(a_ini)
+                        if b_ini:
+                            hist_b_dates[b_ini] = max(hist_b_dates.get(b_ini, datetime.min.date()), r_date)
+                        if n_ini:
+                            hist_b_dates[n_ini] = max(hist_b_dates.get(n_ini, datetime.min.date()), r_date)
                 except Exception:
                     pass
 
+        # If we have State, use it. If not, build sequences dynamically from Rota history
         if "State" in xls.sheet_names:
             df_state = pd.read_excel(xls, sheet_name="State")
             if len(df_state.columns) >= 2:
@@ -123,26 +134,16 @@ def parse_previous_rota(uploaded_file, consultants, sel_s, ytd_s, ytd_e):
                     return str(val).strip() if pd.notna(val) and str(val).strip().upper() not in ['NAN', 'NONE'] else ""
                 
                 master_a_seq = [x.strip().upper() for x in s_str("A_MASTER_SEQ").split(",") if x.strip()]
-                
-                cycle_str = s_str("CYCLE_A_SCHEDULE")
-                if cycle_str:
-                    for item in cycle_str.split(","):
-                        if ":" in item:
-                            k, v = item.split(":")
-                            try: cycle_a_schedule[datetime.strptime(k.strip(), '%Y-%m-%d').date()] = v.strip()
-                            except ValueError: pass
-                
                 b_queue = [x.strip().upper() for x in s_str("B_QUEUE").split(",") if x.strip()]
                 curr_a = s_str("CURRENT_A") or None
                 curr_b = s_str("CURRENT_B") or None
                 
-                last_a_str = s_str("LAST_A_END_DATES")
-                if last_a_str:
-                    for item in last_a_str.split(","):
-                        if ":" in item:
-                            k, d = item.split(":")
-                            try: last_a_dates[k.strip()] = datetime.strptime(d.strip(), '%Y-%m-%d').date()
-                            except ValueError: pass
+        # --- REBUILD SEQUENCE: Prevents randomization if legacy file is uploaded ---
+        if not master_a_seq and master_a_seq_temp:
+            seen = set()
+            master_a_seq = [x for x in reversed(master_a_seq_temp) if not (x in seen or seen.add(x))]
+            master_a_seq.reverse()
+
     except Exception as e:
         st.warning(f"Warning: Could not fully parse the uploaded Memory file. Proceeding safely.")
         
@@ -172,7 +173,6 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
     active_initials = [str(c['Initials']).strip().upper() for c in consultants if c.get('Active', True)]
     name_map = {str(c['Initials']).strip().upper(): c['Full Name'] for c in consultants}
     
-    # Safely deep-copy the counts from the parser so we don't drop data
     counts = {ini: {
         "A_days": hist_counts.get(ini, {}).get("A_days", 0), 
         "B_days": hist_counts.get(ini, {}).get("B_days", 0), 
@@ -280,18 +280,21 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
 
     def is_valid_for_slot(doc, slot_f):
         if doc == "UNCOVERED": return False
-        if (slot_f - last_a_end.get(doc, datetime.min.date())).days < 22: return False
+        
+        # --- CONSULTANT A SAFETY GAP: 28 Days (4 Weeks) ---
+        if (slot_f - last_a_end.get(doc, datetime.min.date())).days < 28: return False
+        
         if any(get_eff_marker(slot_f + timedelta(days=o), doc) in ["AL", "SL", "NO", "OFF"] for o in range(7)): return False
         
         for other_f, inf in temp.items():
             if inf['doc'] == doc and other_f != slot_f:
-                if abs((slot_f - other_f).days) < 22: return False
+                if abs((slot_f - other_f).days) < 28: return False
                 
         for past_date, past_doc in cycle_a_schedule.items():
-            if past_doc == doc and abs((slot_f - past_date).days) < 22: return False
+            if past_doc == doc and abs((slot_f - past_date).days) < 28: return False
             
-        window_start = slot_f - timedelta(days=22)
-        window_end = slot_f + timedelta(days=6 + 22)
+        window_start = slot_f - timedelta(days=28)
+        window_end = slot_f + timedelta(days=6 + 28)
         for d_offset in range((window_end - window_start).days + 1):
             chk_d = window_start + timedelta(days=d_offset)
             if slot_f <= chk_d < slot_f + timedelta(days=7): continue
@@ -318,12 +321,14 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
 
     def is_clean(c, sd):
         if any(get_eff_marker(sd + timedelta(days=o), c) in ["AL", "SL", "NO", "OFF"] for o in range(7)): return False
-        if (to_date(sd) - last_a_end.get(c, datetime.min.date())).days < 22: return False
+        # Uses 28 days for memory retrieval verification
+        if (to_date(sd) - last_a_end.get(c, datetime.min.date())).days < 28: return False
         return True
 
+    # --- CONSULTANT B SAFETY GAP: 21 Days (3 Weeks) ---
     def b_penalty(doc, d):
         d_date = to_date(d)
-        if (d_date - recent_b_shifts.get(doc, datetime.min.date())).days <= 10: return 1
+        if (d_date - recent_b_shifts.get(doc, datetime.min.date())).days <= 21: return 1
         next_fri = d_date + timedelta(days=(4-d_date.weekday())%7)
         if cycle_a_schedule.get(next_fri) == doc or cycle_a_schedule.get(next_fri + timedelta(days=7)) == doc: return 1
         return 0
@@ -387,22 +392,22 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
                         FAIRNESS_GAP = 2
                         
                         q_sub.sort(key=lambda x: (
+                            b_penalty(x[1], curr_d),                      # PRIORITY 1: 21-Day Gap Rule
                             1 if (counts[x[1]]["B_days"] - min_b_days) >= FAIRNESS_GAP else 0,
                             0 if (d_map.get(x[1]) in ["Monday", "Wednesday"] and counts[x[1]]["Nights"] < avg_nights) else 1,
                             1 if (counts[x[1]]["Nights"] - min_nights) >= FAIRNESS_GAP else 0,
                             0 if get_group(x[1]) != pr_a_group else 1,    
                             counts[x[1]]["Nights"],                       
-                            b_penalty(x[1], curr_d),                      
                             x[0]                                          
                         ))
                     else:
                         min_b_days = min([counts[c]["B_days"] for c in b_queue]) if b_queue else 0
                         FAIRNESS_GAP = 2
                         q_sub.sort(key=lambda x: (
+                            b_penalty(x[1], curr_d),                     # PRIORITY 1: 21-Day Gap Rule
                             1 if (counts[x[1]]["B_days"] - min_b_days) >= FAIRNESS_GAP else 0,
                             0 if get_group(x[1]) != pr_a_group else 1,   
                             counts[x[1]]["B_days"],                      
-                            b_penalty(x[1], curr_d),                     
                             x[0] 
                         ))
                     return q_sub
@@ -459,21 +464,21 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
                                 FAIRNESS_GAP = 2
                                 
                                 best = min(pool, key=lambda x: (
+                                    b_penalty(x, curr_d),                     # PRIORITY 1: 21-Day Gap Rule
                                     1 if (counts[x]["B_days"] - min_b_days) >= FAIRNESS_GAP else 0,
                                     0 if (d_map.get(x) in ["Monday", "Wednesday"] and counts[x]["Nights"] < avg_nights) else 1,
                                     1 if (counts[x]["Nights"] - min_nights) >= FAIRNESS_GAP else 0,
                                     0 if get_group(x) != a_group else 1,      
-                                    counts[x]["Nights"],                      
-                                    b_penalty(x, curr_d)                      
+                                    counts[x]["Nights"]                      
                                 ))
                             else:
                                 min_b_days = min([counts[c]["B_days"] for c in pool]) if pool else 0
                                 FAIRNESS_GAP = 2
                                 best = min(pool, key=lambda x: (
+                                    b_penalty(x, curr_d),                     # PRIORITY 1: 21-Day Gap Rule
                                     1 if (counts[x]["B_days"] - min_b_days) >= FAIRNESS_GAP else 0,
                                     0 if get_group(x) != a_group else 1,  
-                                    counts[x]["B_days"],                   
-                                    b_penalty(x, curr_d)                 
+                                    counts[x]["B_days"]                 
                                 ))
                             
                             row["Consultant B"] = name_map.get(best)
