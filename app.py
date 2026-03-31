@@ -19,15 +19,15 @@ B_WORK_DAYS = [0, 1, 2, 3, 4]
 DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
 DEFAULT_STAFF = [
-    {"Initials": "GB", "Full Name": "Giuseppe Barone", "Active": True, "DIL Day": "Friday"},
-    {"Initials": "SD", "Full Name": "Sarita Depani", "Active": True, "DIL Day": "Monday"},
-    {"Initials": "OS", "Full Name": "Olga Slater", "Active": True, "DIL Day": "Tuesday"},
-    {"Initials": "MJ", "Full Name": "Mette Jorgensen", "Active": True, "DIL Day": "Friday"},
-    {"Initials": "CD", "Full Name": "Cat Duncan", "Active": True, "DIL Day": "Tuesday"},
-    {"Initials": "KS", "Full Name": "Kavitha Srivatsa", "Active": True, "DIL Day": "Monday"},
-    {"Initials": "TC", "Full Name": "Tanzina Chowdhury", "Active": True, "DIL Day": "Tuesday"},
-    {"Initials": "ES", "Full Name": "Elwira Szychot", "Active": True, "DIL Day": "Friday"},
-    {"Initials": "TN", "Full Name": "Trung Nguyen", "Active": True, "DIL Day": "Wednesday"},
+    {"Initials": "GB", "Full Name": "Giuseppe Barone", "Active": True, "DIL Day": "Friday", "FTE A": 1.0, "FTE B": 1.0},
+    {"Initials": "SD", "Full Name": "Sarita Depani", "Active": True, "DIL Day": "Monday", "FTE A": 1.0, "FTE B": 1.0},
+    {"Initials": "OS", "Full Name": "Olga Slater", "Active": True, "DIL Day": "Tuesday", "FTE A": 1.0, "FTE B": 1.0},
+    {"Initials": "MJ", "Full Name": "Mette Jorgensen", "Active": True, "DIL Day": "Friday", "FTE A": 1.0, "FTE B": 1.0},
+    {"Initials": "CD", "Full Name": "Cat Duncan", "Active": True, "DIL Day": "Tuesday", "FTE A": 1.0, "FTE B": 1.0},
+    {"Initials": "KS", "Full Name": "Kavitha Srivatsa", "Active": True, "DIL Day": "Monday", "FTE A": 1.0, "FTE B": 1.0},
+    {"Initials": "TC", "Full Name": "Tanzina Chowdhury", "Active": True, "DIL Day": "Tuesday", "FTE A": 1.0, "FTE B": 1.0},
+    {"Initials": "ES", "Full Name": "Elwira Szychot", "Active": True, "DIL Day": "Friday", "FTE A": 1.0, "FTE B": 1.0},
+    {"Initials": "TN", "Full Name": "Trung Nguyen", "Active": True, "DIL Day": "Wednesday", "FTE A": 1.0, "FTE B": 1.0},
 ]
 
 def to_date(d):
@@ -220,6 +220,22 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
     active_initials = [str(c['Initials']).strip().upper() for c in consultants if c.get('Active', True)]
     name_map = {str(c['Initials']).strip().upper(): c['Full Name'] for c in consultants}
     
+    # Extract FTE Multipliers
+    fte_a_map = {}
+    fte_b_map = {}
+    d_map = {}
+    
+    for c in consultants:
+        if c.get('Active', True):
+            ini = str(c.get('Initials', '')).strip().upper()
+            
+            raw_dil = c.get('DIL Day')
+            d_map[ini] = "" if pd.isna(raw_dil) or raw_dil is None or str(raw_dil).strip().upper() in ["NAN", "NONE", "NAT"] else str(raw_dil).strip().capitalize()
+            
+            # Floor of 0.1 prevents math crashes
+            fte_a_map[ini] = max(0.1, float(c.get('FTE A', 1.0)))
+            fte_b_map[ini] = max(0.1, float(c.get('FTE B', 1.0)))
+
     counts = {ini: {
         "A_days": hist_counts.get(ini, {}).get("A_days", 0), 
         "B_days": hist_counts.get(ini, {}).get("B_days", 0), 
@@ -228,18 +244,6 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
     
     period_counts = {ini: {"A_days": 0, "B_days": 0, "Nights": 0} for ini in active_initials}
     recent_b_shifts = hist_b_dates.copy() 
-    
-    d_map = {}
-    for c in consultants:
-        if c.get('Active', True):
-            ini = str(c.get('Initials', '')).strip().upper()
-            raw_dil = c.get('DIL Day')
-            if pd.isna(raw_dil) or raw_dil is None:
-                dil = ""
-            else:
-                dil = str(raw_dil).strip().capitalize()
-                if dil.upper() in ["NAN", "NONE", "NAT"]: dil = ""
-            d_map[ini] = dil
     
     def get_eff_marker(d_date, ini):
         lm = get_leave_marker(leave_df, d_date, ini)
@@ -294,17 +298,6 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
                 temp[f]['locked'] = True
                 break
 
-    def has_heavy_req_nearby(doc, target_f):
-        start_w = target_f - timedelta(days=4*7)
-        end_w = target_f + timedelta(days=4*7)
-        curr_w = start_w
-        while curr_w <= end_w:
-            r_count = sum(1 for o in range(7) if get_eff_marker(curr_w + timedelta(days=o), doc) == "REQ")
-            h_wknd = any(get_eff_marker(curr_w + timedelta(days=o), doc) == "REQ" and (curr_w+timedelta(days=o)).weekday() in [5,6] for o in range(7))
-            if (r_count >= 4) or (r_count >= 3 and h_wknd): return True
-            curr_w += timedelta(days=7)
-        return False
-
     deck_idx = 0
     if cycle_a_schedule:
         last_base_date = max(cycle_a_schedule.keys())
@@ -312,50 +305,83 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
         if last_doc in master_a_seq:
             deck_idx = (master_a_seq.index(last_doc) + 1) % len(master_a_seq)
 
+    # LIVE TRACKER: Follows pacing inside the loop as assignments happen
+    sim_a_counts = {ini: counts[ini]["A_days"] for ini in active_initials}
+
+    # --- THE NEW A-WEEK ENGINE: Live Pacing & Zero Swapping ---
     for f in c_fs:
-        if temp[f]['locked']: continue
-        assigned, attempts = False, 0
+        if temp[f]['locked']:
+            sim_a_counts[temp[f]['doc']] += 1
+            continue
+
+        assigned = False
+        attempts = 0
+        
+        # PASS 1: Strict Check (Respects FTE, Leave, and 28-day gap)
         while not assigned and attempts < len(master_a_seq) * 2:
             candidate = master_a_seq[deck_idx % len(master_a_seq)]
             deck_idx += 1
             attempts += 1
-            if not has_heavy_req_nearby(candidate, f):
-                temp[f]['doc'] = candidate
-                assigned = True
-        if not assigned: temp[f]['doc'] = "UNCOVERED"
-
-    def is_valid_for_slot(doc, slot_f):
-        if doc == "UNCOVERED": return False
-        
-        if (slot_f - last_a_end.get(doc, datetime.min.date())).days < 28: return False
-        if any(get_eff_marker(slot_f + timedelta(days=o), doc) in ["AL", "SL", "NO", "OFF"] for o in range(7)): return False
-        
-        for other_f, inf in temp.items():
-            if inf['doc'] == doc and other_f != slot_f:
-                if abs((slot_f - other_f).days) < 28: return False
-                
-        for past_date, past_doc in cycle_a_schedule.items():
-            if past_doc == doc and abs((slot_f - past_date).days) < 28: return False
             
-        window_start = slot_f - timedelta(days=28)
-        window_end = slot_f + timedelta(days=6 + 28)
-        for d_offset in range((window_end - window_start).days + 1):
-            chk_d = window_start + timedelta(days=d_offset)
-            if slot_f <= chk_d < slot_f + timedelta(days=7): continue
-            if get_eff_marker(chk_d, doc) == "REQ": return False 
-        return True
+            # Pacing Tracker: If they are running 1 FTE equivalent week ahead, SKIP them.
+            norm_c = sim_a_counts[candidate] / fte_a_map[candidate]
+            min_norm = min(sim_a_counts[i] / fte_a_map[i] for i in active_initials)
+            if norm_c - min_norm >= 1.0: 
+                continue
+                
+            # Leave rules
+            if any(get_eff_marker(f + timedelta(days=o), candidate) in ["AL", "SL", "NO", "OFF"] for o in range(7)):
+                continue
+                
+            # 28-day rules (checks history AND current future assignments)
+            too_close = False
+            if (f - last_a_end.get(candidate, datetime.min.date())).days < 28:
+                too_close = True
+            for other_f, inf in temp.items():
+                if inf['doc'] == candidate and abs((f - other_f).days) < 28:
+                    too_close = True
+            for past_date, past_doc in cycle_a_schedule.items():
+                if past_doc == candidate and abs((f - past_date).days) < 28:
+                    too_close = True
+            
+            if too_close:
+                continue
+                
+            temp[f]['doc'] = candidate
+            sim_a_counts[candidate] += 1
+            assigned = True
 
-    for f_idx, f_dt in enumerate(c_fs):
-        if temp[f_dt]['locked']: continue
-        doc = temp[f_dt]['doc']
-        if doc and doc != "UNCOVERED" and not is_valid_for_slot(doc, f_dt):
-            swaps = sorted([(abs(idx - f_idx), f) for idx, f in enumerate(c_fs) if idx != f_idx and not temp[f]['locked'] and temp[f]['doc'] and temp[f]['doc'] != "UNCOVERED"], key=lambda x: x[0])
-            for _, of in swaps:
-                doc_1, doc_2 = temp[f_dt]['doc'], temp[of]['doc']
-                temp[f_dt]['doc'], temp[of]['doc'] = doc_2, doc_1
-                if is_valid_for_slot(doc_2, f_dt) and is_valid_for_slot(doc_1, of): break
-                else: temp[f_dt]['doc'], temp[of]['doc'] = doc_1, doc_2 
+        # PASS 2: Relaxed Check (If rules blocked everyone, ignore FTE pacing to guarantee coverage)
+        if not assigned:
+            attempts = 0
+            while not assigned and attempts < len(master_a_seq):
+                candidate = master_a_seq[deck_idx % len(master_a_seq)]
+                deck_idx += 1
+                attempts += 1
+                
+                if any(get_eff_marker(f + timedelta(days=o), candidate) in ["AL", "SL", "NO", "OFF"] for o in range(7)):
+                    continue
                     
+                too_close = False
+                if (f - last_a_end.get(candidate, datetime.min.date())).days < 28:
+                    too_close = True
+                for other_f, inf in temp.items():
+                    if inf['doc'] == candidate and abs((f - other_f).days) < 28:
+                        too_close = True
+                for past_date, past_doc in cycle_a_schedule.items():
+                    if past_doc == candidate and abs((f - past_date).days) < 28:
+                        too_close = True
+                
+                if too_close:
+                    continue
+                    
+                temp[f]['doc'] = candidate
+                sim_a_counts[candidate] += 1
+                assigned = True
+
+        if not assigned: 
+            temp[f]['doc'] = "UNCOVERED"
+
     for f, inf in temp.items():
         if inf['doc']: cycle_a_schedule[f] = inf['doc']
         
@@ -380,6 +406,10 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
             period_counts[doc_ini][s_type] += 1
             if ytd_s <= to_date(d_date) <= ytd_e:
                 counts[doc_ini][s_type] += 1
+
+    # Apply FTE Math to the B-Queue sorting mechanism
+    norm_b = lambda x: counts[x]["B_days"] / fte_b_map[x]
+    norm_n = lambda x: counts[x]["Nights"] / fte_a_map[x]
 
     while curr_d <= fin_d:            
         wd = curr_d.weekday()
@@ -428,28 +458,28 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
                     if not q_sub: return q_sub
                     
                     if wd in active_b_nights:
-                        avg_nights = sum(counts[c]["Nights"] for c in b_queue) / len(b_queue) if b_queue else 0
-                        min_nights = min([counts[c]["Nights"] for c in b_queue]) if b_queue else 0
-                        min_b_days = min([counts[c]["B_days"] for c in b_queue]) if b_queue else 0
-                        FAIRNESS_GAP = 2
+                        avg_nights = sum(norm_n(c) for c in b_queue) / len(b_queue) if b_queue else 0
+                        min_nights = min([norm_n(c) for c in b_queue]) if b_queue else 0
+                        min_b_days = min([norm_b(c) for c in b_queue]) if b_queue else 0
+                        FAIRNESS_GAP = 1.5
                         
                         q_sub.sort(key=lambda x: (
                             b_penalty(x[1], curr_d),                      
-                            1 if (counts[x[1]]["B_days"] - min_b_days) >= FAIRNESS_GAP else 0,
-                            0 if (d_map.get(x[1]) in ["Monday", "Wednesday"] and counts[x[1]]["Nights"] < avg_nights) else 1,
-                            1 if (counts[x[1]]["Nights"] - min_nights) >= FAIRNESS_GAP else 0,
+                            1 if (norm_b(x[1]) - min_b_days) >= FAIRNESS_GAP else 0,
+                            0 if (d_map.get(x[1]) in ["Monday", "Wednesday"] and norm_n(x[1]) < avg_nights) else 1,
+                            1 if (norm_n(x[1]) - min_nights) >= FAIRNESS_GAP else 0,
                             0 if get_group(x[1]) != pr_a_group else 1,    
-                            counts[x[1]]["Nights"],                       
+                            norm_n(x[1]),                       
                             x[0]                                          
                         ))
                     else:
-                        min_b_days = min([counts[c]["B_days"] for c in b_queue]) if b_queue else 0
-                        FAIRNESS_GAP = 2
+                        min_b_days = min([norm_b(c) for c in b_queue]) if b_queue else 0
+                        FAIRNESS_GAP = 1.5
                         q_sub.sort(key=lambda x: (
                             b_penalty(x[1], curr_d),                     
-                            1 if (counts[x[1]]["B_days"] - min_b_days) >= FAIRNESS_GAP else 0,
+                            1 if (norm_b(x[1]) - min_b_days) >= FAIRNESS_GAP else 0,
                             0 if get_group(x[1]) != pr_a_group else 1,   
-                            counts[x[1]]["B_days"],                      
+                            norm_b(x[1]),                      
                             x[0] 
                         ))
                     return q_sub
@@ -500,27 +530,27 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
                             a_group = get_group(da_i or cur_a)
                             
                             if wd in active_b_nights:
-                                avg_nights = sum(counts[c]["Nights"] for c in pool) / len(pool) if pool else 0
-                                min_nights = min([counts[c]["Nights"] for c in pool]) if pool else 0
-                                min_b_days = min([counts[c]["B_days"] for c in pool]) if pool else 0
-                                FAIRNESS_GAP = 2
+                                avg_nights = sum(norm_n(c) for c in pool) / len(pool) if pool else 0
+                                min_nights = min([norm_n(c) for c in pool]) if pool else 0
+                                min_b_days = min([norm_b(c) for c in pool]) if pool else 0
+                                FAIRNESS_GAP = 1.5
                                 
                                 best = min(pool, key=lambda x: (
                                     b_penalty(x, curr_d),                     
-                                    1 if (counts[x]["B_days"] - min_b_days) >= FAIRNESS_GAP else 0,
-                                    0 if (d_map.get(x) in ["Monday", "Wednesday"] and counts[x]["Nights"] < avg_nights) else 1,
-                                    1 if (counts[x]["Nights"] - min_nights) >= FAIRNESS_GAP else 0,
+                                    1 if (norm_b(x) - min_b_days) >= FAIRNESS_GAP else 0,
+                                    0 if (d_map.get(x) in ["Monday", "Wednesday"] and norm_n(x) < avg_nights) else 1,
+                                    1 if (norm_n(x) - min_nights) >= FAIRNESS_GAP else 0,
                                     0 if get_group(x) != a_group else 1,      
-                                    counts[x]["Nights"]                      
+                                    norm_n(x)                      
                                 ))
                             else:
-                                min_b_days = min([counts[c]["B_days"] for c in pool]) if pool else 0
-                                FAIRNESS_GAP = 2
+                                min_b_days = min([norm_b(c) for c in pool]) if pool else 0
+                                FAIRNESS_GAP = 1.5
                                 best = min(pool, key=lambda x: (
                                     b_penalty(x, curr_d),                     
-                                    1 if (counts[x]["B_days"] - min_b_days) >= FAIRNESS_GAP else 0,
+                                    1 if (norm_b(x) - min_b_days) >= FAIRNESS_GAP else 0,
                                     0 if get_group(x) != a_group else 1,  
-                                    counts[x]["B_days"]                 
+                                    norm_b(x)                 
                                 ))
                             
                             row["Consultant B"] = name_map.get(best)
@@ -563,7 +593,17 @@ def main():
         st.session_state.locums = pd.DataFrame({"Start Date": pd.Series(dtype='datetime64[ns]'), "End Date": pd.Series(dtype='datetime64[ns]'), "Locum Name": pd.Series(dtype='str')}).reset_index(drop=True)
     
     st.sidebar.header("1. Consultant Roster")
-    edited_staff = st.sidebar.data_editor(st.session_state.staff, num_rows="dynamic", column_config={"DIL Day": st.column_config.SelectboxColumn("DIL Day", options=["", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday"])})
+    
+    # --- ALLOWS DOUBLE DIGIT DECIMALS FOR FTE (e.g. 0.66) ---
+    edited_staff = st.sidebar.data_editor(
+        st.session_state.staff, 
+        num_rows="dynamic", 
+        column_config={
+            "DIL Day": st.column_config.SelectboxColumn("DIL Day", options=["", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]),
+            "FTE A": st.column_config.NumberColumn("FTE A", min_value=0.1, max_value=1.0, step=0.01, format="%.2f"),
+            "FTE B": st.column_config.NumberColumn("FTE B", min_value=0.1, max_value=1.0, step=0.01, format="%.2f")
+        }
+    )
     
     st.sidebar.header("2. Locum / Academic Overrides")
     st.sidebar.markdown("<p style='color:#86868b; font-size:14px;'>Leave 'End Date' blank for a 1-day assignment.</p>", unsafe_allow_html=True)
@@ -690,7 +730,6 @@ def main():
                     elif len(prev_rota_df.columns) > 1:
                         date_col_name = prev_rota_df.columns[1]
 
-                # --- DYNAMIC ROW HIDING LOGIC ---
                 threshold_date = None
                 if date_col_name:
                     try:
@@ -710,11 +749,9 @@ def main():
                         if isinstance(d_val, str): dt = pd.to_datetime(d_val, dayfirst=True)
                         else: dt = pd.to_datetime(d_val)
                         
-                        # Apply gray background to weekends/holidays
                         if dt.weekday() >= 5 or (uk_holidays is not None and to_date(dt) in uk_holidays):
                             for c in range(1, len(prev_rota_df.columns) + 1): ws_prev.cell(row=i, column=c).fill = fill
                             
-                        # Hide the row if it's older than the 12-month threshold
                         if threshold_date and dt < threshold_date:
                             ws_prev.row_dimensions[i].hidden = True
                     except Exception:
