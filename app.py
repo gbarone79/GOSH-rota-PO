@@ -587,14 +587,23 @@ def main():
     st.markdown("<style>.stApp {background-color: #fbfbfd !important;} p, h1, h2, h3, span, label, div {color: #1d1d1f; font-family: -apple-system, sans-serif;} div.stButton > button {background-color: #0071e3 !important; color: #fff !important; border-radius: 20px !important;}</style>", unsafe_allow_html=True)
     st.title("Consultant Rota Dashboard")
     
+    # --- SELF-HEALING SESSION STATE ---
     if 'rota_result' not in st.session_state: st.session_state.rota_result = None
-    if 'staff' not in st.session_state: st.session_state.staff = pd.DataFrame(DEFAULT_STAFF).reset_index(drop=True)
+    
+    if 'staff' not in st.session_state: 
+        st.session_state.staff = pd.DataFrame(DEFAULT_STAFF).reset_index(drop=True)
+    else:
+        # Actively forcefully inject missing columns into stubbornly cached memory
+        if 'FTE A' not in st.session_state.staff.columns:
+            st.session_state.staff['FTE A'] = 1.0
+        if 'FTE B' not in st.session_state.staff.columns:
+            st.session_state.staff['FTE B'] = 1.0
+            
     if 'locums' not in st.session_state: 
         st.session_state.locums = pd.DataFrame({"Start Date": pd.Series(dtype='datetime64[ns]'), "End Date": pd.Series(dtype='datetime64[ns]'), "Locum Name": pd.Series(dtype='str')}).reset_index(drop=True)
     
     st.sidebar.header("1. Consultant Roster")
     
-    # --- ALLOWS DOUBLE DIGIT DECIMALS FOR FTE (e.g. 0.66) ---
     edited_staff = st.sidebar.data_editor(
         st.session_state.staff, 
         num_rows="dynamic", 
