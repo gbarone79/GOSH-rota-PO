@@ -144,6 +144,13 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
     active_initials = [str(c.get('Initials', '')).strip().upper() for c in consultants if c.get('Active', True) and str(c.get('Initials', '')).strip()]
     name_map = {str(c.get('Initials', '')).strip().upper(): c.get('Full Name', '') for c in consultants if str(c.get('Initials', '')).strip()}
     
+    def safe_float(val, default=1.0):
+        try:
+            f = float(val)
+            return f if not pd.isna(f) else default
+        except:
+            return default
+
     d_map = {}
     fte_a_map = {}
     fte_b_map = {}
@@ -152,8 +159,8 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
             ini = str(c.get('Initials', '')).strip().upper()
             raw_dil = c.get('DIL Day')
             d_map[ini] = "" if pd.isna(raw_dil) or raw_dil is None or str(raw_dil).strip().upper() in ["NAN", "NONE", "NAT"] else str(raw_dil).strip().capitalize()
-            fte_a_map[ini] = max(0.1, float(c.get('FTE A', 1.0)))
-            fte_b_map[ini] = max(0.1, float(c.get('FTE B', 1.0)))
+            fte_a_map[ini] = max(0.1, safe_float(c.get('FTE A', 1.0)))
+            fte_b_map[ini] = max(0.1, safe_float(c.get('FTE B', 1.0)))
 
     def get_eff_marker(d_date, ini):
         ts = pd.Timestamp(d_date).normalize()
@@ -366,7 +373,6 @@ def main():
     
     st.sidebar.header("1. Consultant Roster")
     
-    # Detached live editing (no forced st.session_state overrides on keystrokes)
     edited_staff = st.sidebar.data_editor(
         st.session_state.staff, 
         num_rows="dynamic", 
@@ -376,7 +382,7 @@ def main():
             "FTE B": st.column_config.NumberColumn("FTE B", min_value=0.1, max_value=1.0, step=0.01, format="%.2f")
         }
     )
-
+    
     st.sidebar.header("2. Locum / Academic Overrides")
     st.sidebar.markdown("<p style='color:#86868b; font-size:14px;'>Leave 'End Date' blank for a 1-day assignment.</p>", unsafe_allow_html=True)
     edited_locums = st.sidebar.data_editor(
@@ -416,12 +422,12 @@ def main():
     with c_y2: ytd_e = st.date_input("YTD End Date:", value=datetime(current_year, 12, 31).date(), format="DD/MM/YYYY")
     st.markdown("---")
 
-    # Clean staff data safely ON BUTTON CLICK so the UI doesn't refresh while typing
+    # The "Bulletproof Data Caster" to fix the Cloud PyArrow issue
     clean_staff = edited_staff.copy()
     if not clean_staff.empty:
-        clean_staff['Active'] = clean_staff['Active'].fillna(True)
-        clean_staff['FTE A'] = clean_staff['FTE A'].fillna(1.0)
-        clean_staff['FTE B'] = clean_staff['FTE B'].fillna(1.0)
+        clean_staff['Active'] = clean_staff['Active'].fillna(True).astype(bool)
+        clean_staff['FTE A'] = pd.to_numeric(clean_staff['FTE A'], errors='coerce').fillna(1.0)
+        clean_staff['FTE B'] = pd.to_numeric(clean_staff['FTE B'], errors='coerce').fillna(1.0)
 
     counts, m_seq, c_sch, bq, ca, cb, h_last, hist_b_dates, prev_rota_df, memory_leave_df = parse_previous_rota(prev_f, clean_staff.to_dict('records'), sel_s, ytd_s, ytd_e) if prev_f else ({}, [], {}, [], None, None, {}, {}, None, pd.DataFrame())
     
