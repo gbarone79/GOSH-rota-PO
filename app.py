@@ -220,7 +220,6 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
     active_initials = [str(c['Initials']).strip().upper() for c in consultants if c.get('Active', True)]
     name_map = {str(c['Initials']).strip().upper(): c['Full Name'] for c in consultants}
     
-    # Extract FTE Multipliers
     fte_a_map = {}
     fte_b_map = {}
     d_map = {}
@@ -228,11 +227,8 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
     for c in consultants:
         if c.get('Active', True):
             ini = str(c.get('Initials', '')).strip().upper()
-            
             raw_dil = c.get('DIL Day')
             d_map[ini] = "" if pd.isna(raw_dil) or raw_dil is None or str(raw_dil).strip().upper() in ["NAN", "NONE", "NAT"] else str(raw_dil).strip().capitalize()
-            
-            # Floor of 0.1 prevents math crashes
             fte_a_map[ini] = max(0.1, float(c.get('FTE A', 1.0)))
             fte_b_map[ini] = max(0.1, float(c.get('FTE B', 1.0)))
 
@@ -305,53 +301,65 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
         if last_doc in master_a_seq:
             deck_idx = (master_a_seq.index(last_doc) + 1) % len(master_a_seq)
 
-    # LIVE TRACKER: Follows pacing inside the loop as assignments happen
+    # LIVE TRACKER: Follows pacing inside the loop
     sim_a_counts = {ini: counts[ini]["A_days"] for ini in active_initials}
 
-    # --- THE NEW A-WEEK ENGINE: Live Pacing & Zero Swapping ---
+    # --- ENHANCED GAP LOGIC: Handles strict and emergency relaxations ---
+    def is_valid_for_slot(doc, slot_f, req_gap=28):
+        if doc == "UNCOVERED": return False
+        
+        # Check against historic ends
+        if (slot_f - last_a_end.get(doc, datetime.min.date())).days < req_gap: return False
+        
+        # Leave check
+        if any(get_eff_marker(slot_f + timedelta(days=o), doc) in ["AL", "SL", "NO", "OFF"] for o in range(7)): return False
+        
+        # Check against new generated shifts (gap between starts = gap from end + 7)
+        for other_f, inf in temp.items():
+            if inf['doc'] == doc and other_f != slot_f:
+                if abs((slot_f - other_f).days) < (req_gap + 7): return False
+                
+        # Check against historical schedule
+        for past_date, past_doc in cycle_a_schedule.items():
+            if past_doc == doc and abs((slot_f - past_date).days) < req_gap: return False
+            
+        # Requests
+        window_start = slot_f - timedelta(days=req_gap)
+        window_end = slot_f + timedelta(days=6 + req_gap)
+        for d_offset in range((window_end - window_start).days + 1):
+            chk_d = window_start + timedelta(days=d_offset)
+            if slot_f <= chk_d < slot_f + timedelta(days=7): continue
+            if get_eff_marker(chk_d, doc) == "REQ": return False 
+            
+        return True
+
+    # --- THE NEW MULTI-PASS A-WEEK ENGINE ---
     for f in c_fs:
         if temp[f]['locked']:
-            sim_a_counts[temp[f]['doc']] += 1
+            # FIX: Adds 7 DAYS to match historical data tracking
+            sim_a_counts[temp[f]['doc']] += 7
             continue
 
         assigned = False
-        attempts = 0
         
-        # PASS 1: Strict Check (Respects FTE, Leave, and 28-day gap)
+        # PASS 1: Strict FTE Pacing + 28-Day Strict Gap
+        attempts = 0
         while not assigned and attempts < len(master_a_seq) * 2:
             candidate = master_a_seq[deck_idx % len(master_a_seq)]
             deck_idx += 1
             attempts += 1
             
-            # Pacing Tracker: If they are running 1 FTE equivalent week ahead, SKIP them.
             norm_c = sim_a_counts[candidate] / fte_a_map[candidate]
             min_norm = min(sim_a_counts[i] / fte_a_map[i] for i in active_initials)
-            if norm_c - min_norm >= 1.0: 
+            if norm_c - min_norm >= 7.0: # (7 days = 1 week ahead limit)
                 continue
                 
-            # Leave rules
-            if any(get_eff_marker(f + timedelta(days=o), candidate) in ["AL", "SL", "NO", "OFF"] for o in range(7)):
-                continue
-                
-            # 28-day rules (checks history AND current future assignments)
-            too_close = False
-            if (f - last_a_end.get(candidate, datetime.min.date())).days < 28:
-                too_close = True
-            for other_f, inf in temp.items():
-                if inf['doc'] == candidate and abs((f - other_f).days) < 28:
-                    too_close = True
-            for past_date, past_doc in cycle_a_schedule.items():
-                if past_doc == candidate and abs((f - past_date).days) < 28:
-                    too_close = True
-            
-            if too_close:
-                continue
-                
-            temp[f]['doc'] = candidate
-            sim_a_counts[candidate] += 1
-            assigned = True
+            if is_valid_for_slot(candidate, f, req_gap=28):
+                temp[f]['doc'] = candidate
+                sim_a_counts[candidate] += 7
+                assigned = True
 
-        # PASS 2: Relaxed Check (If rules blocked everyone, ignore FTE pacing to guarantee coverage)
+        # PASS 2: Relaxed Pacing (Ignore FTE) + 28-Day Strict Gap
         if not assigned:
             attempts = 0
             while not assigned and attempts < len(master_a_seq):
@@ -359,25 +367,23 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
                 deck_idx += 1
                 attempts += 1
                 
-                if any(get_eff_marker(f + timedelta(days=o), candidate) in ["AL", "SL", "NO", "OFF"] for o in range(7)):
-                    continue
-                    
-                too_close = False
-                if (f - last_a_end.get(candidate, datetime.min.date())).days < 28:
-                    too_close = True
-                for other_f, inf in temp.items():
-                    if inf['doc'] == candidate and abs((f - other_f).days) < 28:
-                        too_close = True
-                for past_date, past_doc in cycle_a_schedule.items():
-                    if past_doc == candidate and abs((f - past_date).days) < 28:
-                        too_close = True
+                if is_valid_for_slot(candidate, f, req_gap=28):
+                    temp[f]['doc'] = candidate
+                    sim_a_counts[candidate] += 7
+                    assigned = True
+
+        # PASS 3: EMERGENCY FALLBACK (Ignore FTE + Relax Gap to 21 Days to prevent UNCOVERED)
+        if not assigned:
+            attempts = 0
+            while not assigned and attempts < len(master_a_seq):
+                candidate = master_a_seq[deck_idx % len(master_a_seq)]
+                deck_idx += 1
+                attempts += 1
                 
-                if too_close:
-                    continue
-                    
-                temp[f]['doc'] = candidate
-                sim_a_counts[candidate] += 1
-                assigned = True
+                if is_valid_for_slot(candidate, f, req_gap=21):
+                    temp[f]['doc'] = candidate
+                    sim_a_counts[candidate] += 7
+                    assigned = True
 
         if not assigned: 
             temp[f]['doc'] = "UNCOVERED"
@@ -407,7 +413,6 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
             if ytd_s <= to_date(d_date) <= ytd_e:
                 counts[doc_ini][s_type] += 1
 
-    # Apply FTE Math to the B-Queue sorting mechanism
     norm_b = lambda x: counts[x]["B_days"] / fte_b_map[x]
     norm_n = lambda x: counts[x]["Nights"] / fte_a_map[x]
 
@@ -587,13 +592,11 @@ def main():
     st.markdown("<style>.stApp {background-color: #fbfbfd !important;} p, h1, h2, h3, span, label, div {color: #1d1d1f; font-family: -apple-system, sans-serif;} div.stButton > button {background-color: #0071e3 !important; color: #fff !important; border-radius: 20px !important;}</style>", unsafe_allow_html=True)
     st.title("Consultant Rota Dashboard")
     
-    # --- SELF-HEALING SESSION STATE ---
     if 'rota_result' not in st.session_state: st.session_state.rota_result = None
     
     if 'staff' not in st.session_state: 
         st.session_state.staff = pd.DataFrame(DEFAULT_STAFF).reset_index(drop=True)
     else:
-        # Actively forcefully inject missing columns into stubbornly cached memory
         if 'FTE A' not in st.session_state.staff.columns:
             st.session_state.staff['FTE A'] = 1.0
         if 'FTE B' not in st.session_state.staff.columns:
