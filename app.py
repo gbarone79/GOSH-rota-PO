@@ -49,11 +49,18 @@ def is_b_manual_period(dt):
     
     return m_start <= dt_safe <= m_end
 
+def safe_ini(val):
+    if pd.isna(val) or val is None: return ""
+    s = str(val).strip().upper()
+    if s in ["", "NAN", "NONE", "NAT", "NULL", "<NA>"]: return ""
+    return s
+
 def match_name(val, consultants):
-    val = str(val).strip().upper()
-    if not val or val in ['NAN', 'NONE', 'NAT', '']: return None
+    val = safe_ini(val)
+    if not val: return None
     for c in consultants:
-        ini = str(c.get('Initials', '')).strip().upper()
+        ini = safe_ini(c.get('Initials'))
+        if not ini: continue
         fname = str(c.get('Full Name', '')).strip().upper()
         if val == ini or val == fname: return ini
         if val in fname.split(): return ini
@@ -67,8 +74,8 @@ def parse_previous_rota(uploaded_file, consultants, sel_s, ytd_s, ytd_e):
     master_a_seq_temp = []
     memory_leave_dict = {}
     
-    active_initials = [str(c.get('Initials', '')).strip().upper() for c in consultants if c.get('Active', True) and str(c.get('Initials', '')).strip()]
-    name_map = {str(c.get('Initials', '')).strip().upper(): str(c.get('Full Name', '')).strip() for c in consultants if str(c.get('Initials', '')).strip()}
+    active_initials = [safe_ini(c.get('Initials')) for c in consultants if c.get('Active', True) and safe_ini(c.get('Initials'))]
+    name_map = {safe_ini(c.get('Initials')): str(c.get('Full Name', '')).strip() for c in consultants if safe_ini(c.get('Initials'))}
 
     def safe_raw(val):
         if pd.isna(val): return ""
@@ -122,17 +129,16 @@ def parse_previous_rota(uploaded_file, consultants, sel_s, ytd_s, ytd_e):
         if "State" in xls.sheet_names:
             df_state = pd.read_excel(xls, sheet_name="State")
             state_dict = dict(zip(df_state.iloc[:,0].astype(str).str.strip(), df_state.iloc[:,1]))
-            master_a_seq = [x.strip().upper() for x in str(state_dict.get("A_MASTER_SEQ","")).split(",") if x.strip()]
+            master_a_seq = [x.strip().upper() for x in str(state_dict.get("A_MASTER_SEQ","")).split(",") if x.strip() and x.strip().upper() != "NONE"]
             curr_a = state_dict.get("CURRENT_A")
             curr_b = state_dict.get("CURRENT_B")
             
         if not master_a_seq and master_a_seq_temp:
             seen = set()
-            master_a_seq = [x for x in reversed(master_a_seq_temp) if not (x in seen or seen.add(x))][::-1]
+            master_a_seq = [x for x in reversed(master_a_seq_temp) if not (x in seen or seen.add(x)) and x != "NONE"][::-1]
     except Exception as e:
         st.warning(f"Memory parsing warning: {e}")
         
-    # b_queue is obsolete but returned for function signature compatibility
     return counts, master_a_seq, cycle_a_schedule, [], curr_a, curr_b, last_a_dates, hist_b_dates, prev_rota_df, pd.DataFrame.from_dict(memory_leave_dict, orient='index') if memory_leave_dict else pd.DataFrame()
 
 def get_group(doc_ini):
@@ -141,8 +147,8 @@ def get_group(doc_ini):
     return "UNKNOWN"
 
 def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist_master_a, hist_cycle_a, hist_b_q, hist_curr_a, hist_curr_b, hist_last_a_dates, locum_dict, hist_b_dates, ytd_s, ytd_e):
-    active_initials = [str(c.get('Initials', '')).strip().upper() for c in consultants if c.get('Active', True) and str(c.get('Initials', '')).strip()]
-    name_map = {str(c.get('Initials', '')).strip().upper(): c.get('Full Name', '') for c in consultants if str(c.get('Initials', '')).strip()}
+    active_initials = [safe_ini(c.get('Initials')) for c in consultants if c.get('Active', True) and safe_ini(c.get('Initials'))]
+    name_map = {safe_ini(c.get('Initials')): c.get('Full Name', '') for c in consultants if safe_ini(c.get('Initials'))}
     
     def safe_float(val, default=1.0):
         try:
@@ -156,8 +162,8 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
     fte_b_map = {}
     group_map = {}
     for c in consultants:
-        if c.get('Active', True) and str(c.get('Initials', '')).strip():
-            ini = str(c.get('Initials', '')).strip().upper()
+        ini = safe_ini(c.get('Initials'))
+        if c.get('Active', True) and ini:
             raw_dil = c.get('DIL Day')
             d_map[ini] = "" if pd.isna(raw_dil) or raw_dil is None or str(raw_dil).strip().upper() in ["NAN", "NONE", "NAT"] else str(raw_dil).strip().capitalize()
             fte_a_map[ini] = max(0.1, safe_float(c.get('FTE A', 1.0)))
@@ -332,7 +338,6 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
             if any(locum_dict.get(anc + timedelta(days=o)) for o in range(7)): cur_a = "LOCUM_ACADEMIC"
             else: cur_a = cycle_a_schedule.get(anc, "UNCOVERED")
 
-        # --- THE NEW ELASTIC WEEKLY B-SELECTOR (Destroys Phase Locking) ---
         if wd == 0 or cur_b is None or cur_b == "UNCOVERED":
             if man_b: 
                 cur_b = "MANUAL ENTRY"
@@ -343,12 +348,10 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
                         p_box = b_penalty(x, curr_d)
                         g_pen = group_penalty(cur_a, x)
                         
-                        # Foundation: Absolute shift count to ensure long-term fairness
                         score = norm_b(x)
                         
-                        # Soft Rules (Magnetic Nudges)
-                        if g_pen == 1: score += 3.0 # Discourage same group UNLESS gap > 3
-                        if p_box == 1: score += 1000.0 # Extreme penalty for recently doing A-week
+                        if g_pen == 1: score += 3.0 
+                        if p_box == 1: score += 1000.0 
                         
                         return score
                         
@@ -385,26 +388,22 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
                 if not cur_b or get_eff_marker(curr_d, cur_b) in ["AL", "SL", "NO", "OFF", "DIL", "REQ", "REQB"] or cur_b == da_i:
                     avail = [i for i in active_initials if i not in [da_i, cur_b] and get_eff_marker(curr_d, i) not in ["AL", "SL", "NO", "OFF", "DIL", "REQ", "REQB"]]
                     if avail:
-                        
-                        # --- THE ELASTIC DAILY B-SELECTOR ---
                         def daily_score(x):
                             p_box = b_penalty(x, curr_d)
                             g_pen = group_penalty(da_i, x)
                             
-                            # Foundation: Track TOTAL B shifts + Night emphasis if it's a night shift
                             if wd in active_b_nights:
                                 score = norm_b(x) + norm_n(x)
                             else:
                                 score = norm_b(x)
                                 
-                            # Soft Magnetic Nudges
                             if g_pen == 1: score += 1.5
                             
                             if wd in active_b_nights:
                                 other_b_nights = [n for n in active_b_nights if n != wd]
                                 x_dil = d_map.get(x)
                                 if x_dil and x_dil in DAY_NAMES and DAY_NAMES.index(x_dil) in other_b_nights:
-                                    score -= 2.0 # Encourage perfect Monday/Wednesday night swaps
+                                    score -= 2.0 
                                     
                             if p_box == 1: score += 1000.0
                             
@@ -429,7 +428,6 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
         if da_i: last_a_end[da_i] = to_date(curr_d)
         rota_data.append(row); curr_d += timedelta(days=1)
 
-    # Empty dummy variable for B_QUEUE to prevent breaking old Memory excel files
     state = {"A_MASTER_SEQ": ",".join(master_a_seq), "B_QUEUE": ",".join(active_initials), "CURRENT_A": cur_a or "", "CURRENT_B": cur_b or ""}
     
     summ = [{"Initials": k, "Period A": period_counts[k]["A_days"], "Period B": period_counts[k]["B_days"], "Period Nights": period_counts[k]["Nights"], "Period Total (A+N)": period_counts[k]["A_days"] + period_counts[k]["Nights"], "YTD A": counts[k]["A_days"], "YTD B": counts[k]["B_days"], "YTD Nights": counts[k]["Nights"], "YTD Total (A+N)": counts[k]["A_days"] + counts[k]["Nights"]} for k in active_initials]
@@ -521,8 +519,14 @@ def main():
     with c_y2: ytd_e = st.date_input("YTD End Date:", value=datetime(current_year, 12, 31).date(), format="DD/MM/YYYY")
     st.markdown("---")
 
+    # THE "GHOSTBUSTER" CLOUD FILTER
     clean_staff = edited_staff.copy()
     if not clean_staff.empty:
+        # 1. Clean the Initials column first
+        clean_staff['Initials'] = clean_staff['Initials'].astype(str).str.strip().str.upper()
+        # 2. Hard drop any row where the initials evaluate to empty or 'NONE'
+        clean_staff = clean_staff[~clean_staff['Initials'].isin(['', 'NAN', 'NONE', 'NAT', 'NULL', '<NA>'])]
+        # 3. Apply defaults to remaining valid rows
         clean_staff['Active'] = clean_staff['Active'].fillna(True).astype(bool)
         clean_staff['FTE A'] = pd.to_numeric(clean_staff['FTE A'], errors='coerce').fillna(1.0)
         clean_staff['FTE B'] = pd.to_numeric(clean_staff['FTE B'], errors='coerce').fillna(1.0)
