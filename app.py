@@ -19,15 +19,15 @@ B_WORK_DAYS = [0, 1, 2, 3, 4]
 DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
 DEFAULT_STAFF = [
-    {"Initials": "GB", "Full Name": "Giuseppe Barone", "Active": True, "DIL Day": "Friday", "FTE A": 1.0, "FTE B": 1.0},
-    {"Initials": "SD", "Full Name": "Sarita Depani", "Active": True, "DIL Day": "Monday", "FTE A": 1.0, "FTE B": 1.0},
-    {"Initials": "OS", "Full Name": "Olga Slater", "Active": True, "DIL Day": "Tuesday", "FTE A": 1.0, "FTE B": 1.0},
-    {"Initials": "MJ", "Full Name": "Mette Jorgensen", "Active": True, "DIL Day": "Friday", "FTE A": 1.0, "FTE B": 1.0},
-    {"Initials": "CD", "Full Name": "Cat Duncan", "Active": True, "DIL Day": "Tuesday", "FTE A": 1.0, "FTE B": 1.0},
-    {"Initials": "KS", "Full Name": "Kavitha Srivatsa", "Active": True, "DIL Day": "Monday", "FTE A": 1.0, "FTE B": 1.0},
-    {"Initials": "TC", "Full Name": "Tanzina Chowdhury", "Active": True, "DIL Day": "Tuesday", "FTE A": 1.0, "FTE B": 1.0},
-    {"Initials": "ES", "Full Name": "Elwira Szychot", "Active": True, "DIL Day": "Friday", "FTE A": 1.0, "FTE B": 1.0},
-    {"Initials": "TN", "Full Name": "Trung Nguyen", "Active": True, "DIL Day": "Wednesday", "FTE A": 1.0, "FTE B": 1.0},
+    {"Initials": "GB", "Full Name": "Giuseppe Barone", "Active": True, "DIL Day": "Friday", "FTE A": 1.0, "FTE B": 1.0, "Group": "Solid"},
+    {"Initials": "SD", "Full Name": "Sarita Depani", "Active": True, "DIL Day": "Monday", "FTE A": 1.0, "FTE B": 1.0, "Group": "Neuro"},
+    {"Initials": "OS", "Full Name": "Olga Slater", "Active": True, "DIL Day": "Tuesday", "FTE A": 1.0, "FTE B": 1.0, "Group": "Solid"},
+    {"Initials": "MJ", "Full Name": "Mette Jorgensen", "Active": True, "DIL Day": "Friday", "FTE A": 1.0, "FTE B": 1.0, "Group": "Neuro"},
+    {"Initials": "CD", "Full Name": "Cat Duncan", "Active": True, "DIL Day": "Tuesday", "FTE A": 1.0, "FTE B": 1.0, "Group": "Solid"},
+    {"Initials": "KS", "Full Name": "Kavitha Srivatsa", "Active": True, "DIL Day": "Monday", "FTE A": 1.0, "FTE B": 1.0, "Group": "Neuro"},
+    {"Initials": "TC", "Full Name": "Tanzina Chowdhury", "Active": True, "DIL Day": "Tuesday", "FTE A": 1.0, "FTE B": 1.0, "Group": "Solid"},
+    {"Initials": "ES", "Full Name": "Elwira Szychot", "Active": True, "DIL Day": "Friday", "FTE A": 1.0, "FTE B": 1.0, "Group": "Neuro"},
+    {"Initials": "TN", "Full Name": "Trung Nguyen", "Active": True, "DIL Day": "Wednesday", "FTE A": 1.0, "FTE B": 1.0, "Group": "Solid"},
 ]
 
 def to_date(d):
@@ -123,7 +123,6 @@ def parse_previous_rota(uploaded_file, consultants, sel_s, ytd_s, ytd_e):
             df_state = pd.read_excel(xls, sheet_name="State")
             state_dict = dict(zip(df_state.iloc[:,0].astype(str).str.strip(), df_state.iloc[:,1]))
             master_a_seq = [x.strip().upper() for x in str(state_dict.get("A_MASTER_SEQ","")).split(",") if x.strip()]
-            b_queue = [x.strip().upper() for x in str(state_dict.get("B_QUEUE","")).split(",") if x.strip()]
             curr_a = state_dict.get("CURRENT_A")
             curr_b = state_dict.get("CURRENT_B")
             
@@ -133,7 +132,8 @@ def parse_previous_rota(uploaded_file, consultants, sel_s, ytd_s, ytd_e):
     except Exception as e:
         st.warning(f"Memory parsing warning: {e}")
         
-    return counts, master_a_seq, cycle_a_schedule, b_queue, curr_a, curr_b, last_a_dates, hist_b_dates, prev_rota_df, pd.DataFrame.from_dict(memory_leave_dict, orient='index') if memory_leave_dict else pd.DataFrame()
+    # b_queue is obsolete but returned for function signature compatibility
+    return counts, master_a_seq, cycle_a_schedule, [], curr_a, curr_b, last_a_dates, hist_b_dates, prev_rota_df, pd.DataFrame.from_dict(memory_leave_dict, orient='index') if memory_leave_dict else pd.DataFrame()
 
 def get_group(doc_ini):
     if doc_ini in ["ES", "SD", "MJ", "KS"]: return "NEURO"
@@ -154,6 +154,7 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
     d_map = {}
     fte_a_map = {}
     fte_b_map = {}
+    group_map = {}
     for c in consultants:
         if c.get('Active', True) and str(c.get('Initials', '')).strip():
             ini = str(c.get('Initials', '')).strip().upper()
@@ -161,6 +162,7 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
             d_map[ini] = "" if pd.isna(raw_dil) or raw_dil is None or str(raw_dil).strip().upper() in ["NAN", "NONE", "NAT"] else str(raw_dil).strip().capitalize()
             fte_a_map[ini] = max(0.1, safe_float(c.get('FTE A', 1.0)))
             fte_b_map[ini] = max(0.1, safe_float(c.get('FTE B', 1.0)))
+            group_map[ini] = str(c.get('Group', 'Others')).strip().capitalize()
 
     def get_eff_marker(d_date, ini):
         ts = pd.Timestamp(d_date).normalize()
@@ -170,15 +172,34 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
         if d_map.get(ini) == DAY_NAMES[to_date(d_date).weekday()]: return "DIL"
         return ""
 
+    def is_blocked_for_week(d_date, ini):
+        w_start = d_date - timedelta(days=d_date.weekday())
+        block_count = 0
+        for i in range(5):
+            if get_eff_marker(w_start + timedelta(days=i), ini) in ["AL", "SL", "NO", "OFF"]:
+                block_count += 1
+        return block_count >= 3
+
     def sync(h, a):
         nl = [i for i in h if i in a]
         for i in a:
             if i not in nl: nl.append(i)
         return nl
 
-    master_a_seq = sync(hist_master_a, active_initials) if hist_master_a else active_initials
-    b_queue = sync(hist_b_q, active_initials) if hist_b_q else active_initials
-    
+    if hist_master_a:
+        master_a_seq = sync(hist_master_a, active_initials)
+    else:
+        solids = [i for i in active_initials if group_map.get(i) == "Solid"]
+        neuros = [i for i in active_initials if group_map.get(i) == "Neuro"]
+        others = [i for i in active_initials if group_map.get(i) not in ["Solid", "Neuro"]]
+        random.seed()
+        random.shuffle(solids); random.shuffle(neuros); random.shuffle(others)
+        master_a_seq = []
+        while solids or neuros or others:
+            if solids: master_a_seq.append(solids.pop(0))
+            if neuros: master_a_seq.append(neuros.pop(0))
+            if others: master_a_seq.append(others.pop(0))
+
     curr_d_start = pd.to_datetime(start_date).normalize()
     fin_d = pd.to_datetime(end_date).normalize()
     start_anc = (curr_d_start - timedelta(days=(curr_d_start.weekday() - 4) % 7)).date()
@@ -243,7 +264,7 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
     rota_data = []
     curr_d = curr_d_start
     cur_a = cycle_a_schedule.get(start_anc, "UNCOVERED") if hist_curr_a is None else hist_curr_a
-    cur_b = hist_curr_b if hist_curr_b else (b_queue[0] if b_queue else None)
+    cur_b = hist_curr_b if hist_curr_b else None
     
     counts = {ini: {
         "A_days": hist_counts.get(ini, {}).get("A_days", 0), 
@@ -253,17 +274,17 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
     period_counts = {ini: {"A_days": 0, "B_days": 0, "Nights": 0} for ini in active_initials}
     recent_b_shifts = hist_b_dates.copy()
 
-    sim_b_counts = {ini: counts[ini]["B_days"] for ini in active_initials}
-    sim_n_counts = {ini: counts[ini]["Nights"] for ini in active_initials}
-    
-    others_b = [v for v in sim_b_counts.values() if v > 0]
-    base_b = min(others_b) if others_b else 0
-    others_n = [v for v in sim_n_counts.values() if v > 0]
-    base_n = min(others_n) if others_n else 0
+    others_b = [v for v in counts.values() if v["B_days"] > 0]
+    base_b = min([v["B_days"] for v in others_b]) if others_b else 0
+    others_n = [v for v in counts.values() if v["Nights"] > 0]
+    base_n = min([v["Nights"] for v in others_n]) if others_n else 0
     
     for ini in active_initials:
-        if sim_b_counts[ini] == 0: sim_b_counts[ini] = base_b
-        if sim_n_counts[ini] == 0: sim_n_counts[ini] = base_n
+        if counts[ini]["B_days"] == 0: counts[ini]["B_days"] = base_b
+        if counts[ini]["Nights"] == 0: counts[ini]["Nights"] = base_n
+
+    sim_b_counts = {ini: counts[ini]["B_days"] for ini in active_initials}
+    sim_n_counts = {ini: counts[ini]["Nights"] for ini in active_initials}
 
     def add_score(doc_ini, s_type, d_date):
         if doc_ini and doc_ini in period_counts:
@@ -275,6 +296,21 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
 
     norm_b = lambda x: sim_b_counts[x] / fte_b_map[x]
     norm_n = lambda x: sim_n_counts[x] / fte_a_map[x]
+
+    def b_penalty(doc, d_date):
+        d = to_date(d_date)
+        last_a = last_a_end.get(doc, datetime.min.date())
+        if (d - last_a).days <= 21: return 1
+        for f_date, cand in cycle_a_schedule.items():
+            if cand == doc and 0 <= (f_date - d).days <= 14: return 1
+        return 0
+
+    def group_penalty(a_ini, b_ini):
+        if not a_ini or not b_ini: return 0
+        g_a = group_map.get(a_ini, "Others")
+        g_b = group_map.get(b_ini, "Others")
+        if g_a == "Others" or g_b == "Others": return 0
+        return 1 if g_a == g_b else 0
 
     while curr_d <= fin_d:            
         wd = curr_d.weekday()
@@ -296,10 +332,29 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
             if any(locum_dict.get(anc + timedelta(days=o)) for o in range(7)): cur_a = "LOCUM_ACADEMIC"
             else: cur_a = cycle_a_schedule.get(anc, "UNCOVERED")
 
-        if wd == 0:
-            if man_b: cur_b = "MANUAL ENTRY"
+        # --- THE NEW ELASTIC WEEKLY B-SELECTOR (Destroys Phase Locking) ---
+        if wd == 0 or cur_b is None or cur_b == "UNCOVERED":
+            if man_b: 
+                cur_b = "MANUAL ENTRY"
             else:
-                cur_b = b_queue.pop(0); b_queue.append(cur_b)
+                avail_week = [c for c in active_initials if c != cur_a and not is_blocked_for_week(curr_d, c)]
+                if avail_week:
+                    def week_score(x):
+                        p_box = b_penalty(x, curr_d)
+                        g_pen = group_penalty(cur_a, x)
+                        
+                        # Foundation: Absolute shift count to ensure long-term fairness
+                        score = norm_b(x)
+                        
+                        # Soft Rules (Magnetic Nudges)
+                        if g_pen == 1: score += 3.0 # Discourage same group UNLESS gap > 3
+                        if p_box == 1: score += 1000.0 # Extreme penalty for recently doing A-week
+                        
+                        return score
+                        
+                    cur_b = min(avail_week, key=week_score)
+                else:
+                    cur_b = "UNCOVERED"
 
         rq_d = next((i for i in active_initials if get_eff_marker(curr_d, i) == "REQ"), None)
         rqb_d = next((i for i in active_initials if get_eff_marker(curr_d, i) == "REQB"), None)
@@ -330,7 +385,32 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
                 if not cur_b or get_eff_marker(curr_d, cur_b) in ["AL", "SL", "NO", "OFF", "DIL", "REQ", "REQB"] or cur_b == da_i:
                     avail = [i for i in active_initials if i not in [da_i, cur_b] and get_eff_marker(curr_d, i) not in ["AL", "SL", "NO", "OFF", "DIL", "REQ", "REQB"]]
                     if avail:
-                        best = min(avail, key=lambda x: (1 if (to_date(curr_d)-recent_b_shifts.get(x, datetime.min.date())).days <= 21 else 0, norm_b(x)))
+                        
+                        # --- THE ELASTIC DAILY B-SELECTOR ---
+                        def daily_score(x):
+                            p_box = b_penalty(x, curr_d)
+                            g_pen = group_penalty(da_i, x)
+                            
+                            # Foundation: Track TOTAL B shifts + Night emphasis if it's a night shift
+                            if wd in active_b_nights:
+                                score = norm_b(x) + norm_n(x)
+                            else:
+                                score = norm_b(x)
+                                
+                            # Soft Magnetic Nudges
+                            if g_pen == 1: score += 1.5
+                            
+                            if wd in active_b_nights:
+                                other_b_nights = [n for n in active_b_nights if n != wd]
+                                x_dil = d_map.get(x)
+                                if x_dil and x_dil in DAY_NAMES and DAY_NAMES.index(x_dil) in other_b_nights:
+                                    score -= 2.0 # Encourage perfect Monday/Wednesday night swaps
+                                    
+                            if p_box == 1: score += 1000.0
+                            
+                            return score
+
+                        best = min(avail, key=daily_score)
                         row["Consultant B"] = name_map.get(best)
                         add_score(best, "B_days", curr_d)
                         recent_b_shifts[best] = to_date(curr_d)
@@ -349,8 +429,18 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
         if da_i: last_a_end[da_i] = to_date(curr_d)
         rota_data.append(row); curr_d += timedelta(days=1)
 
-    state = {"A_MASTER_SEQ": ",".join(master_a_seq), "B_QUEUE": ",".join(b_queue), "CURRENT_A": cur_a or "", "CURRENT_B": cur_b or ""}
+    # Empty dummy variable for B_QUEUE to prevent breaking old Memory excel files
+    state = {"A_MASTER_SEQ": ",".join(master_a_seq), "B_QUEUE": ",".join(active_initials), "CURRENT_A": cur_a or "", "CURRENT_B": cur_b or ""}
+    
     summ = [{"Initials": k, "Period A": period_counts[k]["A_days"], "Period B": period_counts[k]["B_days"], "Period Nights": period_counts[k]["Nights"], "Period Total (A+N)": period_counts[k]["A_days"] + period_counts[k]["Nights"], "YTD A": counts[k]["A_days"], "YTD B": counts[k]["B_days"], "YTD Nights": counts[k]["Nights"], "YTD Total (A+N)": counts[k]["A_days"] + counts[k]["Nights"]} for k in active_initials]
+    
+    for row in summ:
+        ini = row["Initials"]
+        if hist_counts.get(ini, {}).get("B_days", 0) == 0 and row["YTD B"] >= base_b:
+            row["YTD B"] -= base_b
+        if hist_counts.get(ini, {}).get("Nights", 0) == 0 and row["YTD Nights"] >= base_n:
+            row["YTD Nights"] -= base_n
+
     return pd.DataFrame(rota_data), pd.DataFrame(summ), state
 
 def main():
@@ -363,6 +453,14 @@ def main():
     if 'staff' not in st.session_state: 
         st.session_state.staff = pd.DataFrame(DEFAULT_STAFF).reset_index(drop=True)
     else:
+        if 'Group' not in st.session_state.staff.columns:
+            def assign_group(ini):
+                ini_str = str(ini).strip().upper()
+                if ini_str in ["GB", "OS", "CD", "TC", "TN"]: return "Solid"
+                if ini_str in ["ES", "SD", "MJ", "KS"]: return "Neuro"
+                return "Others"
+            st.session_state.staff['Group'] = st.session_state.staff['Initials'].apply(assign_group)
+            
         if 'FTE A' not in st.session_state.staff.columns:
             st.session_state.staff['FTE A'] = 1.0
         if 'FTE B' not in st.session_state.staff.columns:
@@ -379,7 +477,8 @@ def main():
         column_config={
             "DIL Day": st.column_config.SelectboxColumn("DIL Day", options=["", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]),
             "FTE A": st.column_config.NumberColumn("FTE A", min_value=0.1, max_value=1.0, step=0.01, format="%.2f"),
-            "FTE B": st.column_config.NumberColumn("FTE B", min_value=0.1, max_value=1.0, step=0.01, format="%.2f")
+            "FTE B": st.column_config.NumberColumn("FTE B", min_value=0.1, max_value=1.0, step=0.01, format="%.2f"),
+            "Group": st.column_config.SelectboxColumn("Group", options=["Solid", "Neuro", "Others"])
         }
     )
     
@@ -422,12 +521,12 @@ def main():
     with c_y2: ytd_e = st.date_input("YTD End Date:", value=datetime(current_year, 12, 31).date(), format="DD/MM/YYYY")
     st.markdown("---")
 
-    # The "Bulletproof Data Caster" to fix the Cloud PyArrow issue
     clean_staff = edited_staff.copy()
     if not clean_staff.empty:
         clean_staff['Active'] = clean_staff['Active'].fillna(True).astype(bool)
         clean_staff['FTE A'] = pd.to_numeric(clean_staff['FTE A'], errors='coerce').fillna(1.0)
         clean_staff['FTE B'] = pd.to_numeric(clean_staff['FTE B'], errors='coerce').fillna(1.0)
+        clean_staff['Group'] = clean_staff['Group'].fillna("Others")
 
     counts, m_seq, c_sch, bq, ca, cb, h_last, hist_b_dates, prev_rota_df, memory_leave_df = parse_previous_rota(prev_f, clean_staff.to_dict('records'), sel_s, ytd_s, ytd_e) if prev_f else ({}, [], {}, [], None, None, {}, {}, None, pd.DataFrame())
     
