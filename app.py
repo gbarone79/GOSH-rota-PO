@@ -66,8 +66,19 @@ def match_name(val, consultants):
         if val in fname.split(): return ini
     return None
 
+def get_bh_group(d):
+    if uk_holidays is None or d not in uk_holidays: return None
+    name = uk_holidays.get(d).upper()
+    if "NEW YEAR" in name: return "NEWYEAR"
+    if "EASTER" in name or "GOOD FRIDAY" in name: return "EASTER"
+    if "MAY" in name or "SPRING" in name or "JUBILEE" in name or "CORONATION" in name:
+        return "EARLY_MAY" if d.day <= 15 else "LATE_MAY"
+    if "SUMMER" in name or "AUGUST" in name: return "AUGUST"
+    if "CHRISTMAS" in name or "BOXING" in name: return "CHRISTMAS"
+    return "OTHER"
+
 def parse_previous_rota(uploaded_file, consultants, sel_s, ytd_s, ytd_e):
-    counts = defaultdict(lambda: {"A_days": 0, "B_days": 0, "Nights": 0})
+    counts = defaultdict(lambda: {"A_days": 0, "B_days": 0, "Nights": 0, "BH_days": 0, "BH_groups": set()})
     master_a_seq, cycle_a_schedule, b_queue, curr_a, curr_b, last_a_dates = [], {}, [], None, None, {}
     hist_b_dates = {}
     prev_rota_df = None
@@ -101,10 +112,22 @@ def parse_previous_rota(uploaded_file, consultants, sel_s, ytd_s, ytd_e):
                     a_ini = match_name(row.get(col_a), consultants)
                     b_ini = match_name(row.get(col_b), consultants)
                     n_ini = match_name(row.get(col_n), consultants)
+                    
+                    is_bh = uk_holidays is not None and r_date in uk_holidays and r_date.weekday() < 5
+                    bh_grp = get_bh_group(r_date) if is_bh else None
+                    
                     if ytd_s <= r_date <= ytd_e and r_date < sel_s:
                         if a_ini: counts[a_ini]["A_days"] += 1
                         if b_ini: counts[b_ini]["B_days"] += 1
                         if n_ini: counts[n_ini]["Nights"] += 1
+                        if is_bh:
+                            if a_ini:
+                                counts[a_ini]["BH_days"] += 1
+                                if bh_grp: counts[a_ini]["BH_groups"].add(bh_grp)
+                            if b_ini:
+                                counts[b_ini]["BH_days"] += 1
+                                if bh_grp: counts[b_ini]["BH_groups"].add(bh_grp)
+                                
                     if r_date < sel_s:
                         if a_ini:
                             cycle_a_schedule[r_date] = a_ini
@@ -227,42 +250,74 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
                 temp[f]['doc'], temp[f]['locked'] = doc, True
                 break
 
-    deck_idx = 0
-    if cycle_a_schedule:
-        last_base = max(cycle_a_schedule.keys())
-        last_doc = cycle_a_schedule[last_base]
-        if last_doc in master_a_seq:
-            deck_idx = (master_a_seq.index(last_doc) + 1) % len(master_a_seq)
-
     sim_a_counts = {ini: hist_counts.get(ini, {}).get("A_days", 0) for ini in active_initials}
-    others_a = [v for v in sim_a_counts.values() if v > 0]
-    base_a = min(others_a) if others_a else 0
     for ini in active_initials:
-        if sim_a_counts[ini] == 0: sim_a_counts[ini] = base_a
+        if sim_a_counts[ini] == 0: 
+            others_a = [v for v in sim_a_counts.values() if v > 0]
+            sim_a_counts[ini] = min(others_a) if others_a else 0
 
-    def is_valid_a(doc, slot_f, req_gap=28):
-        if (slot_f - last_a_end.get(doc, datetime.min.date())).days < req_gap: return False
-        if any(get_eff_marker(slot_f + timedelta(days=o), doc) in ["AL", "SL", "NO", "OFF"] for o in range(7)): return False
-        for f, info in temp.items():
-            if info['doc'] == doc and f != slot_f and abs((slot_f - f).days) < (req_gap + 7): return False
-        return True
+    # --- BANK HOLIDAY TRACKING ---
+    sim_bh_groups = {ini: set(hist_counts.get(ini, {}).get("BH_groups", set())) for ini in active_initials}
+    
+    def week_has_bh(slot_f):
+        return any(uk_holidays is not None and to_date(slot_f + timedelta(days=i)) in uk_holidays and (slot_f + timedelta(days=i)).weekday() < 5 for i in range(7))
+        
+    def get_week_bh_group(slot_f):
+        for i in range(7):
+            d = to_date(slot_f + timedelta(days=i))
+            if uk_holidays is not None and d in uk_holidays and d.weekday() < 5:
+                return get_bh_group(d)
+        return None
 
+    # --- THE UNIFIED A-WEEK SCORING ENGINE ---
     for f in c_fs:
+        has_bh = week_has_bh(f)
+        
         if temp[f]['locked']: 
             sim_a_counts[temp[f]['doc']] += 7
+            if has_bh:
+                bg = get_week_bh_group(f)
+                if bg: sim_bh_groups[temp[f]['doc']].add(bg)
             continue
-        assigned = False
-        for p in [(7.0, 28), (999, 28), (999, 21)]:
-            if assigned: break
-            attempts = 0
-            while not assigned and attempts < len(master_a_seq):
-                cand = master_a_seq[deck_idx % len(master_a_seq)]
-                deck_idx += 1; attempts += 1
-                norm_c = sim_a_counts[cand] / fte_a_map[cand]
-                min_norm = min(sim_a_counts[i] / fte_a_map[i] for i in active_initials)
-                if (norm_c - min_norm < p[0]) and is_valid_a(cand, f, p[1]):
-                    temp[f]['doc'] = cand; sim_a_counts[cand] += 7; assigned = True
-        if not assigned: temp[f]['doc'] = "UNCOVERED"
+            
+        avail = []
+        for cand in active_initials:
+            if not any(get_eff_marker(f + timedelta(days=o), cand) in ["AL", "SL", "NO", "OFF"] for o in range(7)):
+                valid = True
+                for t_f, t_info in temp.items():
+                    if t_info['doc'] == cand and t_f != f and abs((f - t_f).days) < 21:
+                        valid = False
+                        break
+                if valid and (f - last_a_end.get(cand, datetime.min.date())).days >= 21:
+                    avail.append(cand)
+                    
+        if not avail:
+            temp[f]['doc'] = "UNCOVERED"
+            continue
+            
+        def a_score(x):
+            bh_pen = 0
+            if has_bh:
+                bh_pen = len(sim_bh_groups[x]) * 10000
+                
+            rest_pen = 0
+            if (f - last_a_end.get(x, datetime.min.date())).days < 28: 
+                rest_pen += 1000
+            for t_f, t_info in temp.items():
+                if t_info['doc'] == x and t_f != f and abs((f - t_f).days) < 28:
+                    rest_pen += 1000
+                    
+            fairness = sim_a_counts[x] / fte_a_map[x]
+            
+            return (bh_pen, rest_pen, fairness)
+            
+        best = min(avail, key=a_score)
+        temp[f]['doc'] = best
+        sim_a_counts[best] += 7
+        last_a_end[best] = f
+        if has_bh:
+            bg = get_week_bh_group(f)
+            if bg: sim_bh_groups[best].add(bg)
 
     for f, info in temp.items():
         if info['doc']: cycle_a_schedule[f] = info['doc']
@@ -275,9 +330,12 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
     counts = {ini: {
         "A_days": hist_counts.get(ini, {}).get("A_days", 0), 
         "B_days": hist_counts.get(ini, {}).get("B_days", 0), 
-        "Nights": hist_counts.get(ini, {}).get("Nights", 0)
+        "Nights": hist_counts.get(ini, {}).get("Nights", 0),
+        "BH_days": hist_counts.get(ini, {}).get("BH_days", 0),
+        "BH_groups": set(hist_counts.get(ini, {}).get("BH_groups", set()))
     } for ini in active_initials}
-    period_counts = {ini: {"A_days": 0, "B_days": 0, "Nights": 0} for ini in active_initials}
+    
+    period_counts = {ini: {"A_days": 0, "B_days": 0, "Nights": 0, "BH_days": 0} for ini in active_initials}
     recent_b_shifts = hist_b_dates.copy()
 
     others_b = [v for v in counts.values() if v["B_days"] > 0]
@@ -321,7 +379,7 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
     while curr_d <= fin_d:            
         wd = curr_d.weekday()
         man_b = is_b_manual_period(curr_d)
-        is_bh_today = uk_holidays is not None and to_date(curr_d) in uk_holidays
+        is_bh_today = uk_holidays is not None and to_date(curr_d) in uk_holidays and curr_d.weekday() < 5
         
         w_start = curr_d - timedelta(days=wd)
         is_bh_week = False
@@ -347,14 +405,10 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
                     def week_score(x):
                         p_box = b_penalty(x, curr_d)
                         g_pen = group_penalty(cur_a, x)
-                        
                         score = norm_b(x)
-                        
                         if g_pen == 1: score += 3.0 
                         if p_box == 1: score += 1000.0 
-                        
                         return score
-                        
                     cur_b = min(avail_week, key=week_score)
                 else:
                     cur_b = "UNCOVERED"
@@ -391,7 +445,6 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
                         def daily_score(x):
                             p_box = b_penalty(x, curr_d)
                             g_pen = group_penalty(da_i, x)
-                            
                             if wd in active_b_nights:
                                 score = norm_b(x) + norm_n(x)
                             else:
@@ -406,7 +459,6 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
                                     score -= 2.0 
                                     
                             if p_box == 1: score += 1000.0
-                            
                             return score
 
                         best = min(avail, key=daily_score)
@@ -424,13 +476,23 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
                     b_ini = next((k for k, v in name_map.items() if v == row["Consultant B"]), None)
                     if b_ini: add_score(b_ini, "Nights", curr_d)
 
+        if is_bh_today:
+            b_ini = next((k for k, v in name_map.items() if v == row["Consultant B"]), None)
+            bh_grp = get_bh_group(to_date(curr_d))
+            for ini in [da_i, b_ini]:
+                if ini and ini in period_counts:
+                    period_counts[ini]["BH_days"] += 1
+                    if ytd_s <= to_date(curr_d) <= ytd_e:
+                        counts[ini]["BH_days"] += 1
+                        if bh_grp: counts[ini]["BH_groups"].add(bh_grp)
+
         for i in active_initials: row[i] = get_eff_marker(curr_d, i)
         if da_i: last_a_end[da_i] = to_date(curr_d)
         rota_data.append(row); curr_d += timedelta(days=1)
 
     state = {"A_MASTER_SEQ": ",".join(master_a_seq), "B_QUEUE": ",".join(active_initials), "CURRENT_A": cur_a or "", "CURRENT_B": cur_b or ""}
     
-    summ = [{"Initials": k, "Period A": period_counts[k]["A_days"], "Period B": period_counts[k]["B_days"], "Period Nights": period_counts[k]["Nights"], "Period Total (A+N)": period_counts[k]["A_days"] + period_counts[k]["Nights"], "YTD A": counts[k]["A_days"], "YTD B": counts[k]["B_days"], "YTD Nights": counts[k]["Nights"], "YTD Total (A+N)": counts[k]["A_days"] + counts[k]["Nights"]} for k in active_initials]
+    summ = [{"Initials": k, "Period A": period_counts[k]["A_days"], "Period B": period_counts[k]["B_days"], "Period Nights": period_counts[k]["Nights"], "Period Total (A+N)": period_counts[k]["A_days"] + period_counts[k]["Nights"], "YTD A": counts[k]["A_days"], "YTD B": counts[k]["B_days"], "YTD Nights": counts[k]["Nights"], "YTD Total (A+N)": counts[k]["A_days"] + counts[k]["Nights"], "YTD BH": counts[k]["BH_days"]} for k in active_initials]
     
     for row in summ:
         ini = row["Initials"]
@@ -519,14 +581,10 @@ def main():
     with c_y2: ytd_e = st.date_input("YTD End Date:", value=datetime(current_year, 12, 31).date(), format="DD/MM/YYYY")
     st.markdown("---")
 
-    # THE "GHOSTBUSTER" CLOUD FILTER
     clean_staff = edited_staff.copy()
     if not clean_staff.empty:
-        # 1. Clean the Initials column first
         clean_staff['Initials'] = clean_staff['Initials'].astype(str).str.strip().str.upper()
-        # 2. Hard drop any row where the initials evaluate to empty or 'NONE'
         clean_staff = clean_staff[~clean_staff['Initials'].isin(['', 'NAN', 'NONE', 'NAT', 'NULL', '<NA>'])]
-        # 3. Apply defaults to remaining valid rows
         clean_staff['Active'] = clean_staff['Active'].fillna(True).astype(bool)
         clean_staff['FTE A'] = pd.to_numeric(clean_staff['FTE A'], errors='coerce').fillna(1.0)
         clean_staff['FTE B'] = pd.to_numeric(clean_staff['FTE B'], errors='coerce').fillna(1.0)
