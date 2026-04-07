@@ -59,7 +59,6 @@ def match_name(val, consultants):
     val = safe_ini(val)
     if not val: return None
     
-    # Clean generic medical/UK titles to isolate the actual name
     for prefix in ["DR ", "DR. ", "MR ", "MR. ", "MS ", "MS. ", "MISS ", "PROF ", "PROF. "]:
         if val.startswith(prefix):
             val = val[len(prefix):].strip()
@@ -72,10 +71,8 @@ def match_name(val, consultants):
         fname = str(c.get('Full Name', '')).strip().upper()
         f_words = [w for w in fname.replace(".", " ").split() if len(w) > 1]
         
-        # Exact string match
         if val == ini or val == fname: return ini
         
-        # Fuzzy match: If the legacy sheet has just a surname (or "Srivatsa K"), catch it
         if any(vw in f_words for vw in v_words): 
             return ini
             
@@ -113,7 +110,6 @@ def parse_previous_rota(uploaded_file, consultants, sel_s, ytd_s, ytd_e):
     try:
         xls = pd.ExcelFile(uploaded_file)
         
-        # SMART SHEET DETECTION: Finds the correct tab even if it's not named 'Rota'
         sheet_to_use = None
         if "Rota" in xls.sheet_names:
             sheet_to_use = "Rota"
@@ -129,8 +125,23 @@ def parse_previous_rota(uploaded_file, consultants, sel_s, ytd_s, ytd_e):
         df_rota = pd.read_excel(xls, sheet_name=sheet_to_use)
         clean_rota_data = []
         
-        # SMART COLUMN DETECTION: Adapts to slightly varied legacy header names
-        date_col = next((c for c in df_rota.columns if "DATE" in str(c).strip().upper()), df_rota.columns[0])
+        date_col = None
+        for c in df_rota.columns:
+            if "DATE" in str(c).strip().upper():
+                date_col = c
+                break
+        if not date_col:
+            for c in df_rota.columns:
+                valid_dates = 0
+                sample = df_rota[c].dropna().head(10)
+                for val in sample:
+                    if isinstance(val, (datetime, pd.Timestamp)): valid_dates += 1
+                    elif isinstance(val, str) and ('/' in val or '-' in val) and len(str(val)) >= 8 and any(char.isdigit() for char in str(val)): valid_dates += 1
+                if valid_dates >= 3: 
+                    date_col = c
+                    break
+        if not date_col: date_col = df_rota.columns[0]
+
         col_a, col_b, col_n = None, None, None
         for c in df_rota.columns:
             c_str = str(c).strip().upper()
@@ -141,13 +152,12 @@ def parse_previous_rota(uploaded_file, consultants, sel_s, ytd_s, ytd_e):
         if not col_a and len(df_rota.columns) > 2: col_a = df_rota.columns[2]
         if not col_b and len(df_rota.columns) > 3: col_b = df_rota.columns[3]
         if not col_n and len(df_rota.columns) > 4: col_n = df_rota.columns[4]
-        
+            
         for _, row in df_rota.iterrows():
             try:
                 d_val = row[date_col]
                 if pd.isna(d_val): continue
                 
-                # Robust date parsing
                 if isinstance(d_val, str): r_date = pd.to_datetime(d_val, dayfirst=True).date()
                 elif isinstance(d_val, datetime): r_date = d_val.date()
                 else: r_date = pd.to_datetime(d_val).date()
@@ -227,7 +237,6 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
         except:
             return default
 
-    # Date sanitization to strictly native python datetime.date
     curr_d_start = pd.to_datetime(start_date).date()
     fin_d = pd.to_datetime(end_date).date()
     ytd_s_d = pd.to_datetime(ytd_s).date()
@@ -289,7 +298,6 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
 
     c_fs = []
     chk = start_anc
-    # STRICT SHIFT LIMIT: A-week calculation stops perfectly at the fin_d, no phantom assignments.
     while chk <= fin_d:
         if not any(locum_dict.get(chk + timedelta(days=o)) for o in range(7)): 
             c_fs.append(chk)
@@ -320,7 +328,6 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
                 return get_bh_group(d)
         return None
 
-    # --- THE UNIFIED A-WEEK SCORING ENGINE ---
     for f in c_fs:
         has_bh = week_has_bh(f)
         
@@ -408,7 +415,6 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
 
     def add_score(doc_ini, s_type, d_date):
         if doc_ini and doc_ini in period_counts:
-            # Active Period ONLY
             if curr_d_start <= d_date <= fin_d:
                 period_counts[doc_ini][s_type] += 1
             if ytd_s_d <= d_date <= ytd_e_d:
@@ -437,11 +443,9 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
         if g_a == "Others" or g_b == "Others": return 0
         return 1 if g_a == g_b else 0
 
-    # THE EXTENDED LOOP: Calculates Active period normally, builds empty Skeleton Buffer for the extra 365 days
     while curr_d <= fin_d + timedelta(days=365):            
         wd = curr_d.weekday()
         
-        # Initialize Skeleton Row
         row = {"Date": curr_d.strftime("%d/%m/%Y"), "Day": DAY_NAMES[wd], "Consultant A": "", "Consultant B": "", "Nights": ""}
         
         if curr_d <= fin_d:
@@ -493,7 +497,6 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
             da_n = lc_d if lc_d else (name_map.get(rq_d, rq_d) if rq_d else name_map.get(cur_a, cur_a))
             da_i = (cur_a if cur_a not in ["UNCOVERED", "LOCUM_ACADEMIC"] else None) if not rq_d and not lc_d else rq_d
 
-            # Apply Assignments to Row
             row["Consultant A"] = da_n
             if da_i: add_score(da_i, "A_days", curr_d)
             if wd in active_a_nights: 
@@ -567,12 +570,10 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
 
             if da_i: last_a_end[da_i] = curr_d
             
-            # Snapshots Memory exactly on End Date
             if curr_d == fin_d:
                 final_cur_a = cur_a
                 final_cur_b = cur_b
 
-        # Apply specific DIL and Leave markers for everyone ALWAYS (including Buffer)
         for i in active_initials: row[i] = get_eff_marker(curr_d, i)
         rota_data.append(row)
         curr_d += timedelta(days=1)
@@ -712,11 +713,11 @@ def main():
         try:
             target_str = pd.to_datetime(sel_e).strftime("%d/%m/%Y")
             l_idx = rota[rota['Date'] == target_str].index[-1]
-            st.dataframe(rota.iloc[:l_idx+1].style.apply(highlight, axis=1), height=450)
-        except: st.dataframe(rota.style.apply(highlight, axis=1), height=450)
+            st.dataframe(rota.iloc[:l_idx+1].style.apply(highlight, axis=1), use_container_width=True, height=450)
+        except: st.dataframe(rota.style.apply(highlight, axis=1), use_container_width=True, height=450)
         
         st.subheader("Fairness Calculator")
-        st.dataframe(summ)
+        st.dataframe(summ, use_container_width=True)
         
         out = io.BytesIO()
         with pd.ExcelWriter(out, engine='openpyxl') as writer:
