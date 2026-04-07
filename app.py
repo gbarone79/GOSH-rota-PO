@@ -58,12 +58,27 @@ def safe_ini(val):
 def match_name(val, consultants):
     val = safe_ini(val)
     if not val: return None
+    
+    # Clean generic medical/UK titles to isolate the actual name
+    for prefix in ["DR ", "DR. ", "MR ", "MR. ", "MS ", "MS. ", "MISS ", "PROF ", "PROF. "]:
+        if val.startswith(prefix):
+            val = val[len(prefix):].strip()
+            
+    v_words = [w for w in val.replace(".", " ").split() if len(w) > 1]
+    
     for c in consultants:
         ini = safe_ini(c.get('Initials'))
         if not ini: continue
         fname = str(c.get('Full Name', '')).strip().upper()
+        f_words = [w for w in fname.replace(".", " ").split() if len(w) > 1]
+        
+        # Exact string match
         if val == ini or val == fname: return ini
-        if val in fname.split(): return ini
+        
+        # Fuzzy match: If the legacy sheet has just a surname (or "Srivatsa K"), catch it
+        if any(vw in f_words for vw in v_words): 
+            return ini
+            
     return None
 
 def get_bh_group(d):
@@ -97,61 +112,89 @@ def parse_previous_rota(uploaded_file, consultants, sel_s, ytd_s, ytd_e):
 
     try:
         xls = pd.ExcelFile(uploaded_file)
+        
+        # SMART SHEET DETECTION: Finds the correct tab even if it's not named 'Rota'
+        sheet_to_use = None
         if "Rota" in xls.sheet_names:
-            df_rota = pd.read_excel(xls, sheet_name="Rota")
-            clean_rota_data = []
-            date_col = next((c for c in df_rota.columns if str(c).strip().upper() == "DATE"), df_rota.columns[0])
-            col_a = next((c for c in df_rota.columns if str(c).strip().upper() in ["CONSULTANT A", "ATTENDING"]), None)
-            col_b = next((c for c in df_rota.columns if str(c).strip().upper() in ["CONSULTANT B", "B CONSULTANT"]), None)
-            col_n = next((c for c in df_rota.columns if str(c).strip().upper() in ["NIGHTS", "NIGHT"]), None)
+            sheet_to_use = "Rota"
+        else:
+            for sn in xls.sheet_names:
+                df_test = pd.read_excel(xls, sheet_name=sn, nrows=5)
+                if any("DATE" in str(c).strip().upper() for c in df_test.columns) or any("DAY" in str(c).strip().upper() for c in df_test.columns):
+                    sheet_to_use = sn
+                    break
+            if not sheet_to_use:
+                sheet_to_use = xls.sheet_names[0]
+                
+        df_rota = pd.read_excel(xls, sheet_name=sheet_to_use)
+        clean_rota_data = []
+        
+        # SMART COLUMN DETECTION: Adapts to slightly varied legacy header names
+        date_col = next((c for c in df_rota.columns if "DATE" in str(c).strip().upper()), df_rota.columns[0])
+        col_a, col_b, col_n = None, None, None
+        for c in df_rota.columns:
+            c_str = str(c).strip().upper()
+            if not col_a and ("CONSULTANT A" in c_str or "ATTENDING" in c_str or c_str == "A"): col_a = c
+            if not col_b and ("CONSULTANT B" in c_str or "B CONSULTANT" in c_str or c_str == "B"): col_b = c
+            if not col_n and ("NIGHT" in c_str): col_n = c
             
-            for _, row in df_rota.iterrows():
-                try:
-                    d_val = row[date_col]
-                    if pd.isna(d_val): continue
-                    r_date = pd.to_datetime(d_val, dayfirst=True).date()
-                    a_ini = match_name(row.get(col_a), consultants)
-                    b_ini = match_name(row.get(col_b), consultants)
-                    n_ini = match_name(row.get(col_n), consultants)
+        if not col_a and len(df_rota.columns) > 2: col_a = df_rota.columns[2]
+        if not col_b and len(df_rota.columns) > 3: col_b = df_rota.columns[3]
+        if not col_n and len(df_rota.columns) > 4: col_n = df_rota.columns[4]
+        
+        for _, row in df_rota.iterrows():
+            try:
+                d_val = row[date_col]
+                if pd.isna(d_val): continue
+                
+                # Robust date parsing
+                if isinstance(d_val, str): r_date = pd.to_datetime(d_val, dayfirst=True).date()
+                elif isinstance(d_val, datetime): r_date = d_val.date()
+                else: r_date = pd.to_datetime(d_val).date()
+                
+                a_ini = match_name(row.get(col_a), consultants)
+                b_ini = match_name(row.get(col_b), consultants)
+                n_ini = match_name(row.get(col_n), consultants)
+                
+                is_bh = uk_holidays is not None and r_date in uk_holidays and r_date.weekday() < 5
+                bh_grp = get_bh_group(r_date) if is_bh else None
+                
+                if r_date.weekday() == 0 and b_ini:
+                    last_b_week_start[b_ini] = r_date
                     
-                    is_bh = uk_holidays is not None and r_date in uk_holidays and r_date.weekday() < 5
-                    bh_grp = get_bh_group(r_date) if is_bh else None
-                    
-                    if r_date.weekday() == 0 and b_ini:
-                        last_b_week_start[b_ini] = r_date
-                        
-                    if ytd_s <= r_date <= ytd_e and r_date < sel_s:
-                        if a_ini: counts[a_ini]["A_days"] += 1
-                        if b_ini: counts[b_ini]["B_days"] += 1
-                        if n_ini: counts[n_ini]["Nights"] += 1
-                        if is_bh:
-                            if a_ini:
-                                counts[a_ini]["BH_days"] += 1
-                                if bh_grp: counts[a_ini]["BH_groups"].add(bh_grp)
-                            if b_ini:
-                                counts[b_ini]["BH_days"] += 1
-                                if bh_grp: counts[b_ini]["BH_groups"].add(bh_grp)
-                                
-                    if r_date < sel_s:
+                if ytd_s <= r_date <= ytd_e and r_date < sel_s:
+                    if a_ini: counts[a_ini]["A_days"] += 1
+                    if b_ini: counts[b_ini]["B_days"] += 1
+                    if n_ini: counts[n_ini]["Nights"] += 1
+                    if is_bh:
                         if a_ini:
-                            cycle_a_schedule[r_date] = a_ini
-                            last_a_dates[a_ini] = max(last_a_dates.get(a_ini, datetime.min.date()), r_date)
-                            if not master_a_seq_temp or master_a_seq_temp[-1] != a_ini: master_a_seq_temp.append(a_ini)
-                        if b_ini: hist_b_dates[b_ini] = max(hist_b_dates.get(b_ini, datetime.min.date()), r_date)
-                        if n_ini: hist_b_dates[n_ini] = max(hist_b_dates.get(n_ini, datetime.min.date()), r_date)
-                    
-                    l_data = {ini: safe_raw(row.get(ini)) for ini in active_initials}
-                    memory_leave_dict[pd.to_datetime(r_date)] = l_data
-                    clean_row = {"Date": r_date.strftime("%d/%m/%Y"), "Day": DAY_NAMES[r_date.weekday()],
-                                "Consultant A": name_map.get(a_ini, safe_raw(row.get(col_a))),
-                                "Consultant B": name_map.get(b_ini, safe_raw(row.get(col_b))),
-                                "Nights": name_map.get(n_ini, safe_raw(row.get(col_n))), **l_data}
-                    clean_rota_data.append(clean_row)
-                except: continue
-            if clean_rota_data:
-                df_temp = pd.DataFrame(clean_rota_data)
-                mask = (df_temp['Consultant A'] != '') | (df_temp['Consultant B'] != '') | (df_temp['Nights'] != '')
-                if mask.any(): prev_rota_df = df_temp.loc[:mask[::-1].idxmax()].copy()
+                            counts[a_ini]["BH_days"] += 1
+                            if bh_grp: counts[a_ini]["BH_groups"].add(bh_grp)
+                        if b_ini:
+                            counts[b_ini]["BH_days"] += 1
+                            if bh_grp: counts[b_ini]["BH_groups"].add(bh_grp)
+                            
+                if r_date < sel_s:
+                    if a_ini:
+                        cycle_a_schedule[r_date] = a_ini
+                        last_a_dates[a_ini] = max(last_a_dates.get(a_ini, datetime.min.date()), r_date)
+                        if not master_a_seq_temp or master_a_seq_temp[-1] != a_ini: master_a_seq_temp.append(a_ini)
+                    if b_ini: hist_b_dates[b_ini] = max(hist_b_dates.get(b_ini, datetime.min.date()), r_date)
+                    if n_ini: hist_b_dates[n_ini] = max(hist_b_dates.get(n_ini, datetime.min.date()), r_date)
+                
+                l_data = {ini: safe_raw(row.get(ini)) for ini in active_initials}
+                memory_leave_dict[pd.to_datetime(r_date)] = l_data
+                clean_row = {"Date": r_date.strftime("%d/%m/%Y"), "Day": DAY_NAMES[r_date.weekday()],
+                            "Consultant A": name_map.get(a_ini, safe_raw(row.get(col_a))),
+                            "Consultant B": name_map.get(b_ini, safe_raw(row.get(col_b))),
+                            "Nights": name_map.get(n_ini, safe_raw(row.get(col_n))), **l_data}
+                clean_rota_data.append(clean_row)
+            except: continue
+            
+        if clean_rota_data:
+            df_temp = pd.DataFrame(clean_rota_data)
+            mask = (df_temp['Consultant A'] != '') | (df_temp['Consultant B'] != '') | (df_temp['Nights'] != '')
+            if mask.any(): prev_rota_df = df_temp.loc[:mask[::-1].idxmax()].copy()
 
         if "State" in xls.sheet_names:
             df_state = pd.read_excel(xls, sheet_name="State")
@@ -669,11 +712,11 @@ def main():
         try:
             target_str = pd.to_datetime(sel_e).strftime("%d/%m/%Y")
             l_idx = rota[rota['Date'] == target_str].index[-1]
-            st.dataframe(rota.iloc[:l_idx+1].style.apply(highlight, axis=1), use_container_width=True, height=450)
-        except: st.dataframe(rota.style.apply(highlight, axis=1), use_container_width=True, height=450)
+            st.dataframe(rota.iloc[:l_idx+1].style.apply(highlight, axis=1), height=450)
+        except: st.dataframe(rota.style.apply(highlight, axis=1), height=450)
         
         st.subheader("Fairness Calculator")
-        st.dataframe(summ, use_container_width=True)
+        st.dataframe(summ)
         
         out = io.BytesIO()
         with pd.ExcelWriter(out, engine='openpyxl') as writer:
