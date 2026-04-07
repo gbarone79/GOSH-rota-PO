@@ -328,6 +328,7 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
                 return get_bh_group(d)
         return None
 
+    # --- THE UNIFIED A-WEEK SCORING ENGINE ---
     for f in c_fs:
         has_bh = week_has_bh(f)
         
@@ -467,6 +468,11 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
                 if any(locum_dict.get(anc + timedelta(days=o)) for o in range(7)): cur_a = "LOCUM_ACADEMIC"
                 else: cur_a = cycle_a_schedule.get(anc, "UNCOVERED")
 
+            # --- DEFCON 4 / TEAM AVERAGE CALCULATION ---
+            blocked_count = sum(1 for c in active_initials if is_blocked_for_week(curr_d, c))
+            high_leave_mode = blocked_count >= 4
+            avg_b = sum(sim_b_counts.values()) / len(sim_b_counts) if sim_b_counts else 0
+
             if wd == 0 or cur_b is None or cur_b == "UNCOVERED":
                 if man_b: 
                     cur_b = "MANUAL ENTRY"
@@ -475,13 +481,17 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
                     if avail_week:
                         def week_score(x):
                             p_box = b_penalty(x, curr_d)
+                            if high_leave_mode: p_box = 0 # Drop A-B penalty in Defcon 4
+                            
                             g_pen = group_penalty(cur_a, x)
-                            bb_pen = 1 if (curr_d - last_b_week_start.get(x, datetime.min.date())).days <= 14 else 0
+                            bb_pen = 1 if (curr_d - last_b_week_start.get(x, datetime.min.date())).days < 14 else 0
+                            ceiling_pen = 1 if (sim_b_counts[x] - avg_b) >= 5 else 0
                             
                             score = norm_b(x)
                             if g_pen == 1: score += 3.0 
                             if bb_pen == 1: score += 500.0 
                             if p_box == 1: score += 1000.0 
+                            if ceiling_pen == 1: score += 5000.0 # Absolute 5-shift block
                             return score
                             
                         cur_b = min(avail_week, key=week_score)
@@ -521,9 +531,12 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
                         if avail:
                             def daily_score(x):
                                 p_box = b_penalty(x, curr_d)
+                                if high_leave_mode: p_box = 0
+                                
                                 g_pen = group_penalty(da_i, x)
                                 recent_b = (curr_d - recent_b_shifts.get(x, datetime.min.date())).days
                                 bb_pen = 1 if recent_b < 7 else 0
+                                ceiling_pen = 1 if (sim_b_counts[x] - avg_b) >= 5 else 0
                                 
                                 if wd in active_b_nights:
                                     score = norm_b(x) + norm_n(x)
@@ -532,6 +545,7 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
                                     
                                 if g_pen == 1: score += 1.5
                                 if bb_pen == 1: score += 500.0 
+                                if ceiling_pen == 1: score += 5000.0
                                 
                                 if wd in active_b_nights:
                                     other_b_nights = [n for n in active_b_nights if n != wd]
