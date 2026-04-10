@@ -589,19 +589,34 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
                     avail_week = [c for c in active_initials if c != cur_a and not is_blocked_for_week(curr_d, c)]
                     if avail_week:
                         def week_score(x):
+                            # Strict priority order for normal weeks:
+                            # 1) prevent 5-shift runaway
+                            # 2) preserve Solid/Neuro pairing
+                            # 3) avoid back-to-back B weeks
+                            # 4) avoid B-after-A where possible
+                            # 5) fairness only as final tie-breaker
+                            CEILING_W = 10000.0
+                            GROUP_W = 100.0
+                            BB_W = 10.0
+                            PBOX_W_NORMAL = 1.0
+                            PBOX_W_CRISIS = 0.25
+                            FAIRNESS_SCALE = 1000.0
+
                             p_box = b_penalty(x, curr_d)
-                            if high_leave_mode: p_box = 0 
-                            
                             g_pen = group_penalty(cur_a, x)
                             bb_pen = 1 if (curr_d - last_b_week_start.get(x, datetime.min.date())).days <= 14 else 0
                             ceiling_pen = 1 if (sim_b_counts[x] - avg_b) >= 5 else 0
-                            
-                            score = norm_b(x)
-                            if g_pen == 1: score += 3.0 
-                            # Reduced to soft sacrifice to prevent UNCOVERED shifts
-                            if bb_pen == 1: score += 20.0 
-                            if p_box == 1: score += 10.0 
-                            if ceiling_pen == 1: score += 5000.0 
+
+                            p_box_weight = PBOX_W_CRISIS if high_leave_mode else PBOX_W_NORMAL
+                            fairness_component = norm_b(x)
+
+                            score = (
+                                ceiling_pen * CEILING_W
+                                + g_pen * GROUP_W
+                                + bb_pen * BB_W
+                                + p_box * p_box_weight
+                                + (fairness_component / FAIRNESS_SCALE)
+                            )
                             return score
                             
                         cur_b = min(avail_week, key=week_score)
@@ -640,31 +655,43 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
                         avail = [i for i in active_initials if i not in [da_i, cur_b] and get_eff_marker(curr_d, i) not in ["AL", "SL", "NO", "OFF", "DIL", "REQ", "REQB"]]
                         if avail:
                             def daily_score(x):
+                                # Strict priority order for normal weeks:
+                                # 1) prevent 5-shift runaway
+                                # 2) preserve Solid/Neuro pairing
+                                # 3) avoid back-to-back B days
+                                # 4) avoid B-after-A where possible
+                                # 5) fairness only as final tie-breaker
+                                CEILING_W = 10000.0
+                                GROUP_W = 100.0
+                                BB_W = 10.0
+                                PBOX_W_NORMAL = 1.0
+                                PBOX_W_CRISIS = 0.25
+                                FAIRNESS_SCALE = 1000.0
+                                DIL_BONUS = 0.01
+
                                 p_box = b_penalty(x, curr_d)
-                                if high_leave_mode: p_box = 0
-                                
                                 g_pen = group_penalty(da_i, x)
                                 recent_b = (curr_d - recent_b_shifts.get(x, datetime.min.date())).days
                                 bb_pen = 1 if recent_b < 7 else 0
                                 ceiling_pen = 1 if (sim_b_counts[x] - avg_b) >= 5 else 0
-                                
-                                if wd in active_b_nights:
-                                    score = norm_b(x) + norm_n(x)
-                                else:
-                                    score = norm_b(x)
-                                    
-                                if g_pen == 1: score += 1.5
-                                # Reduced to soft sacrifice to prevent UNCOVERED shifts
-                                if bb_pen == 1: score += 20.0 
-                                if p_box == 1: score += 10.0 
-                                if ceiling_pen == 1: score += 5000.0
-                                
+
+                                p_box_weight = PBOX_W_CRISIS if high_leave_mode else PBOX_W_NORMAL
+                                fairness_component = norm_b(x) + (norm_n(x) if wd in active_b_nights else 0)
+
+                                score = (
+                                    ceiling_pen * CEILING_W
+                                    + g_pen * GROUP_W
+                                    + bb_pen * BB_W
+                                    + p_box * p_box_weight
+                                    + (fairness_component / FAIRNESS_SCALE)
+                                )
+
                                 if wd in active_b_nights:
                                     other_b_nights = [n for n in active_b_nights if n != wd]
                                     x_dil = d_map.get(x)
                                     if x_dil and x_dil in DAY_NAMES and DAY_NAMES.index(x_dil) in other_b_nights:
-                                        score -= 2.0 
-                                        
+                                        score -= DIL_BONUS
+
                                 return score
 
                             best = min(avail, key=daily_score)
