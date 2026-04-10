@@ -341,15 +341,20 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
             continue
             
         avail = []
-        for cand in active_initials:
-            if not any(get_eff_marker(f + timedelta(days=o), cand) in ["AL", "SL", "NO", "OFF"] for o in range(7)):
-                valid = True
-                for t_f, t_info in temp.items():
-                    if t_info['doc'] == cand and t_f != f and abs((f - t_f).days) < 21:
-                        valid = False
-                        break
-                if valid and (f - last_a_end.get(cand, datetime.min.date())).days >= 21:
-                    avail.append(cand)
+        
+        # 1. EMERGENCY FALLBACK ENGINE (Progressive Rest Rule Drop)
+        for gap in [21, 14, 7]:
+            for cand in active_initials:
+                if not any(get_eff_marker(f + timedelta(days=o), cand) in ["AL", "SL", "NO", "OFF"] for o in range(7)):
+                    valid = True
+                    for t_f, t_info in temp.items():
+                        if t_info['doc'] == cand and t_f != f and abs((f - t_f).days) < gap:
+                            valid = False
+                            break
+                    if valid and (f - last_a_end.get(cand, datetime.min.date())).days >= gap:
+                        avail.append(cand)
+            if avail:
+                break
                     
         if not avail:
             temp[f]['doc'] = "UNCOVERED"
@@ -367,8 +372,24 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
                 if t_info['doc'] == x and t_f != f and abs((f - t_f).days) < 28:
                     rest_pen += 1000
                     
+            # 2. THE LOOKAHEAD TRAP DETECTOR (1-Week Ahead)
+            lookahead_pen = 0
+            f_next = f + timedelta(days=7)
+            if f_next in temp and not temp[f_next]['locked']:
+                avail_next = False
+                for cand in active_initials:
+                    if cand == x: continue # x just worked, blocked for next week by 21-day rule
+                    if not any(get_eff_marker(f_next + timedelta(days=o), cand) in ["AL", "SL", "NO", "OFF"] for o in range(7)):
+                        last_c = last_a_end.get(cand, datetime.min.date())
+                        # Need at least someone available with 14 days rest to prevent complete trap
+                        if (f_next - last_c).days >= 14:
+                            avail_next = True
+                            break
+                if not avail_next:
+                    lookahead_pen = 100000 # Massive penalty if this choice causes gridlock next week
+                    
             fairness = sim_a_counts[x] / fte_a_map[x]
-            return (bh_pen, rest_pen, fairness)
+            return (lookahead_pen, bh_pen, rest_pen, fairness)
             
         best = min(avail, key=a_score)
         temp[f]['doc'] = best
@@ -468,7 +489,6 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
                 if any(locum_dict.get(anc + timedelta(days=o)) for o in range(7)): cur_a = "LOCUM_ACADEMIC"
                 else: cur_a = cycle_a_schedule.get(anc, "UNCOVERED")
 
-            # --- DEFCON 4 / TEAM AVERAGE CALCULATION ---
             blocked_count = sum(1 for c in active_initials if is_blocked_for_week(curr_d, c))
             high_leave_mode = blocked_count >= 4
             avg_b = sum(sim_b_counts.values()) / len(sim_b_counts) if sim_b_counts else 0
@@ -481,7 +501,7 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
                     if avail_week:
                         def week_score(x):
                             p_box = b_penalty(x, curr_d)
-                            if high_leave_mode: p_box = 0 # Drop A-B penalty in Defcon 4
+                            if high_leave_mode: p_box = 0 
                             
                             g_pen = group_penalty(cur_a, x)
                             bb_pen = 1 if (curr_d - last_b_week_start.get(x, datetime.min.date())).days < 14 else 0
@@ -491,7 +511,7 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
                             if g_pen == 1: score += 3.0 
                             if bb_pen == 1: score += 500.0 
                             if p_box == 1: score += 1000.0 
-                            if ceiling_pen == 1: score += 5000.0 # Absolute 5-shift block
+                            if ceiling_pen == 1: score += 5000.0 
                             return score
                             
                         cur_b = min(avail_week, key=week_score)
