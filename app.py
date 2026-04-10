@@ -328,7 +328,7 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
                 return get_bh_group(d)
         return None
 
-    # --- THE UNIFIED A-WEEK SCORING ENGINE ---
+    # --- THE UPGRADED A-WEEK SCORING ENGINE ---
     for f in c_fs:
         has_bh = week_has_bh(f)
         
@@ -342,8 +342,8 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
             
         avail = []
         
-        # 1. EMERGENCY FALLBACK ENGINE (Progressive Rest Rule Drop)
-        for gap in [21, 14, 7]:
+        # STRICT HIERARCHY: Force a full 28-day rest before ever considering 21, 14, or 7.
+        for gap in [28, 21, 14, 7]:
             for cand in active_initials:
                 if not any(get_eff_marker(f + timedelta(days=o), cand) in ["AL", "SL", "NO", "OFF"] for o in range(7)):
                     valid = True
@@ -361,35 +361,25 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
             continue
             
         def a_score(x):
-            bh_pen = 0
-            if has_bh:
-                bh_pen = len(sim_bh_groups[x]) * 10000
-                
-            rest_pen = 0
-            if (f - last_a_end.get(x, datetime.min.date())).days < 28: 
-                rest_pen += 1000
-            for t_f, t_info in temp.items():
-                if t_info['doc'] == x and t_f != f and abs((f - t_f).days) < 28:
-                    rest_pen += 1000
-                    
-            # 2. THE LOOKAHEAD TRAP DETECTOR (1-Week Ahead)
+            bh_pen = len(sim_bh_groups[x]) * 10000 if has_bh else 0
+            
+            # 1-Week Lookahead: If picking 'x' leaves next week totally empty, apply massive penalty.
             lookahead_pen = 0
             f_next = f + timedelta(days=7)
             if f_next in temp and not temp[f_next]['locked']:
                 avail_next = False
                 for cand in active_initials:
-                    if cand == x: continue # x just worked, blocked for next week by 21-day rule
+                    if cand == x: continue 
                     if not any(get_eff_marker(f_next + timedelta(days=o), cand) in ["AL", "SL", "NO", "OFF"] for o in range(7)):
                         last_c = last_a_end.get(cand, datetime.min.date())
-                        # Need at least someone available with 14 days rest to prevent complete trap
                         if (f_next - last_c).days >= 14:
                             avail_next = True
                             break
                 if not avail_next:
-                    lookahead_pen = 100000 # Massive penalty if this choice causes gridlock next week
+                    lookahead_pen = 100000 
                     
             fairness = sim_a_counts[x] / fte_a_map[x]
-            return (lookahead_pen, bh_pen, rest_pen, fairness)
+            return (lookahead_pen, bh_pen, fairness)
             
         best = min(avail, key=a_score)
         temp[f]['doc'] = best
@@ -451,7 +441,8 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
         past_a = [f for f, cand in cycle_a_schedule.items() if cand == doc and f <= d_date]
         if past_a:
             last_a = max(past_a)
-            if (d_date - last_a).days <= 21: return 1
+            # Softened to 14 days (allows B-shift 2 weeks after A-shift)
+            if (d_date - last_a).days <= 14: return 1
             
         for f_date, cand in cycle_a_schedule.items():
             if cand == doc and 0 <= (f_date - d_date).days <= 14: return 1
@@ -504,13 +495,14 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
                             if high_leave_mode: p_box = 0 
                             
                             g_pen = group_penalty(cur_a, x)
-                            bb_pen = 1 if (curr_d - last_b_week_start.get(x, datetime.min.date())).days < 14 else 0
+                            bb_pen = 1 if (curr_d - last_b_week_start.get(x, datetime.min.date())).days <= 14 else 0
                             ceiling_pen = 1 if (sim_b_counts[x] - avg_b) >= 5 else 0
                             
                             score = norm_b(x)
                             if g_pen == 1: score += 3.0 
-                            if bb_pen == 1: score += 500.0 
-                            if p_box == 1: score += 1000.0 
+                            # Reduced to soft sacrifice to prevent UNCOVERED shifts
+                            if bb_pen == 1: score += 20.0 
+                            if p_box == 1: score += 10.0 
                             if ceiling_pen == 1: score += 5000.0 
                             return score
                             
@@ -564,7 +556,9 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
                                     score = norm_b(x)
                                     
                                 if g_pen == 1: score += 1.5
-                                if bb_pen == 1: score += 500.0 
+                                # Reduced to soft sacrifice to prevent UNCOVERED shifts
+                                if bb_pen == 1: score += 20.0 
+                                if p_box == 1: score += 10.0 
                                 if ceiling_pen == 1: score += 5000.0
                                 
                                 if wd in active_b_nights:
@@ -573,7 +567,6 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
                                     if x_dil and x_dil in DAY_NAMES and DAY_NAMES.index(x_dil) in other_b_nights:
                                         score -= 2.0 
                                         
-                                if p_box == 1: score += 1000.0
                                 return score
 
                             best = min(avail, key=daily_score)
