@@ -328,66 +328,164 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
                 return get_bh_group(d)
         return None
 
-    # --- THE UPGRADED A-WEEK SCORING ENGINE ---
+    # --- A-WEEK ASSIGNMENT ENGINE: MOST-CONSTRAINED FIRST + BACKTRACKING ---
+    def week_start_for_a_gap(d_date):
+        return d_date - timedelta(days=(d_date.weekday() - 4) % 7)
+
+    week_base_candidates = {}
+    week_block_counts = {}
     for f in c_fs:
-        has_bh = week_has_bh(f)
-        
-        if temp[f]['locked']: 
-            sim_a_counts[temp[f]['doc']] += 7
-            last_a_end[temp[f]['doc']] = f
-            if has_bh:
-                bg = get_week_bh_group(f)
-                if bg: sim_bh_groups[temp[f]['doc']].add(bg)
-            continue
-            
-        avail = []
-        
-        # STRICT HIERARCHY: Force a full 28-day rest before ever considering 21, 14, or 7.
-        for gap in [28, 21, 14, 7]:
-            for cand in active_initials:
-                if not any(get_eff_marker(f + timedelta(days=o), cand) in ["AL", "SL", "NO", "OFF"] for o in range(7)):
-                    valid = True
-                    for t_f, t_info in temp.items():
-                        if t_info['doc'] == cand and t_f != f and abs((f - t_f).days) < gap:
-                            valid = False
-                            break
-                    if valid and (f - last_a_end.get(cand, datetime.min.date())).days >= gap:
-                        avail.append(cand)
-            if avail:
-                break
-                    
-        if not avail:
-            temp[f]['doc'] = "UNCOVERED"
-            continue
-            
-        def a_score(x):
-            bh_pen = len(sim_bh_groups[x]) * 10000 if has_bh else 0
-            
-            # 1-Week Lookahead: If picking 'x' leaves next week totally empty, apply massive penalty.
-            lookahead_pen = 0
-            f_next = f + timedelta(days=7)
-            if f_next in temp and not temp[f_next]['locked']:
-                avail_next = False
-                for cand in active_initials:
-                    if cand == x: continue 
-                    if not any(get_eff_marker(f_next + timedelta(days=o), cand) in ["AL", "SL", "NO", "OFF"] for o in range(7)):
-                        last_c = last_a_end.get(cand, datetime.min.date())
-                        if (f_next - last_c).days >= 14:
-                            avail_next = True
-                            break
-                if not avail_next:
-                    lookahead_pen = 100000 
-                    
-            fairness = sim_a_counts[x] / fte_a_map[x]
-            return (lookahead_pen, bh_pen, fairness)
-            
-        best = min(avail, key=a_score)
-        temp[f]['doc'] = best
-        sim_a_counts[best] += 7
-        last_a_end[best] = f
-        if has_bh:
-            bg = get_week_bh_group(f)
-            if bg: sim_bh_groups[best].add(bg)
+        base_cands = []
+        blocked = 0
+        for cand in active_initials:
+            if any(get_eff_marker(f + timedelta(days=o), cand) in ["AL", "SL", "NO", "OFF"] for o in range(7)):
+                blocked += 1
+            else:
+                base_cands.append(cand)
+        week_base_candidates[f] = base_cands
+        week_block_counts[f] = blocked
+
+    prior_a_week = {}
+    for ini, last_date in hist_last_a_dates.items():
+        if ini in active_initials and last_date:
+            prior_a_week[ini] = week_start_for_a_gap(last_date)
+
+    master_order = {ini: idx for idx, ini in enumerate(master_a_seq)}
+    last_b_anchor = {ini: week_start_for_a_gap(dt) for ini, dt in hist_last_b_week.items() if ini in active_initials and dt}
+
+    def solve_a_weeks(min_gap_days):
+        assigned = {}
+        assigned_by_doc = {ini: [] for ini in active_initials}
+        local_a_counts = sim_a_counts.copy()
+        local_bh_groups = {ini: set(groups) for ini, groups in sim_bh_groups.items()}
+
+        for ini, wk in prior_a_week.items():
+            assigned_by_doc.setdefault(ini, []).append(wk)
+
+        for f in c_fs:
+            if temp[f]['locked']:
+                locked_doc = temp[f]['doc']
+                if locked_doc not in active_initials:
+                    continue
+                conflict = any(abs((f - prev_f).days) < min_gap_days for prev_f in assigned_by_doc.setdefault(locked_doc, []))
+                if conflict:
+                    return None
+                assigned[f] = locked_doc
+                assigned_by_doc[locked_doc].append(f)
+                local_a_counts[locked_doc] += 7
+                if week_has_bh(f):
+                    bg = get_week_bh_group(f)
+                    if bg:
+                        local_bh_groups[locked_doc].add(bg)
+
+        unassigned = {f for f in c_fs if f not in assigned and not temp[f]['locked']}
+
+        def is_gap_ok(cand, f):
+            return all(abs((f - prev_f).days) >= min_gap_days for prev_f in assigned_by_doc.get(cand, []))
+
+        def current_candidates(f):
+            return [cand for cand in week_base_candidates.get(f, []) if is_gap_ok(cand, f)]
+
+        def choose_next_week():
+            best_week = None
+            best_key = None
+            best_cands = None
+            for f in unassigned:
+                cands = current_candidates(f)
+                key = (len(cands), -week_block_counts.get(f, 0), 0 if week_has_bh(f) else 1, f)
+                if best_key is None or key < best_key:
+                    best_week = f
+                    best_key = key
+                    best_cands = cands
+            return best_week, best_cands
+
+        def candidate_score(cand, f):
+            prev_weeks = assigned_by_doc.get(cand, [])
+            closest_gap = min([abs((f - prev_f).days) for prev_f in prev_weeks], default=9999)
+            gap_tier = 0 if closest_gap >= 28 else 1
+
+            # Sacrifice rule: it is preferable to use someone coming straight off a B-week
+            # than to force somebody else into a 14-day A-gap later.
+            last_b_gap = (f - last_b_anchor.get(cand, datetime.min.date())).days if cand in last_b_anchor else 9999
+            sacrifice_bonus = 0 if 0 <= last_b_gap <= 14 else 1
+
+            future_pressure = 0
+            for other_f in unassigned:
+                if other_f == f:
+                    continue
+                remaining = 0
+                for other_cand in week_base_candidates.get(other_f, []):
+                    if other_cand == cand:
+                        continue
+                    if all(abs((other_f - prev_f).days) >= min_gap_days for prev_f in assigned_by_doc.get(other_cand, [])):
+                        remaining += 1
+                if remaining == 0:
+                    future_pressure += 1000
+                elif remaining == 1:
+                    future_pressure += 10
+
+            bh_pen = len(local_bh_groups[cand]) if week_has_bh(f) else 0
+            fairness = local_a_counts[cand] / fte_a_map[cand]
+            rota_order = master_order.get(cand, 9999)
+            return (gap_tier, future_pressure, sacrifice_bonus, bh_pen, fairness, rota_order)
+
+        def dfs():
+            if not unassigned:
+                return True
+
+            f, cands = choose_next_week()
+            if f is None:
+                return True
+            if not cands:
+                return False
+
+            ordered = sorted(cands, key=lambda cand: candidate_score(cand, f))
+            unassigned.remove(f)
+            for cand in ordered:
+                assigned[f] = cand
+                assigned_by_doc.setdefault(cand, []).append(f)
+                local_a_counts[cand] += 7
+                added_bh = None
+                if week_has_bh(f):
+                    added_bh = get_week_bh_group(f)
+                    if added_bh:
+                        local_bh_groups[cand].add(added_bh)
+
+                if dfs():
+                    return True
+
+                if added_bh and added_bh not in hist_counts.get(cand, {}).get("BH_groups", set()):
+                    still_used_elsewhere = any(
+                        other_f != f and assigned.get(other_f) == cand and get_week_bh_group(other_f) == added_bh
+                        for other_f in assigned
+                    )
+                    if not still_used_elsewhere:
+                        local_bh_groups[cand].discard(added_bh)
+                local_a_counts[cand] -= 7
+                assigned_by_doc[cand].pop()
+                assigned.pop(f, None)
+
+            unassigned.add(f)
+            return False
+
+        if dfs():
+            return assigned
+        return None
+
+    solved_a = solve_a_weeks(21)
+    if solved_a is None:
+        solved_a = solve_a_weeks(14)
+
+    for f in c_fs:
+        if temp[f]['locked']:
+            if temp[f]['doc'] in active_initials:
+                cycle_a_schedule[f] = temp[f]['doc']
+            else:
+                cycle_a_schedule[f] = "UNCOVERED"
+        elif solved_a and f in solved_a:
+            cycle_a_schedule[f] = solved_a[f]
+        else:
+            cycle_a_schedule[f] = "UNCOVERED"
 
     for f, info in temp.items():
         if info['doc']: cycle_a_schedule[f] = info['doc']
