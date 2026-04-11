@@ -442,14 +442,29 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
                         elif f > return_f:
                             assigned_since = any(return_f <= w < f for w in assigned_by_doc.get(cand, []))
                             if not assigned_since and return_f in unassigned: return_pref = 2
+                            
+            return_skip_pen = 1 if return_pref == 2 else 0
+            leave_return_tier = 0 if return_pref == 0 else 1
 
             last_b_gap = (f - last_b_anchor.get(cand, datetime.min.date())).days if cand in last_b_anchor else 9999
-            sacrifice_bonus = 0 if 0 <= last_b_gap <= 14 else 1
+            
+            # Neutralize sacrifice_bonus if the candidate is fully rested (>= 28 days)
+            if gap_tier == 1:
+                sacrifice_bonus = 0 if 0 <= last_b_gap <= 14 else 1
+            else:
+                sacrifice_bonus = 1
 
-            bh_pen = len(local_bh_groups[cand]) if week_has_bh(f) else 0
+            # Absolute Rest Tie-Breaker: Prioritize the person waiting the longest
+            if prev_weeks:
+                last_a_overall = max([w for w in prev_weeks if w < f], default=datetime.min.date())
+                absolute_rest_days = -(f - last_a_overall).days if last_a_overall != datetime.min.date() else -9999
+            else:
+                absolute_rest_days = -9999
+
             fairness = local_a_counts[cand] / fte_a_map[cand]
             rota_order = master_order.get(cand, 9999)
-            return (gap_tier, future_pressure, return_pref, sacrifice_bonus, bh_pen, fairness, rota_order)
+            
+            return (gap_tier, future_pressure, return_skip_pen, leave_return_tier, sacrifice_bonus, absolute_rest_days, fairness, rota_order)
 
         def dfs():
             if not unassigned: return True
@@ -625,7 +640,6 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
                             g_pen = group_penalty(cur_a, x)
                             bb_pen = 1 if (curr_d - last_b_week_start.get(x, datetime.min.date())).days < 14 else 0
                             
-                            # Lexicographic Order: Runaway > Fairness > Group Coupling > B2B > B-after-A > fot
                             return (is_runaway, monday_guard, fairness_band, g_pen, bb_pen, p_box, fot)
                             
                         cur_b = min(avail_week, key=week_score)
