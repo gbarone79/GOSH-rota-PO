@@ -344,6 +344,23 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
                 current_block_start = None
                 block_length = 0
 
+    def leave_return_flags(cand, f):
+        pending_earlier_due_return = False
+        is_due_return_week = False
+        
+        for start_f, return_f in leave_blocks[cand]:
+            if return_f <= f:
+                prev = [w for w in assigned_by_doc.get(cand, []) if w < start_f]
+                last_a = max(prev) if prev else datetime.min.date()
+                if (start_f - last_a).days >= 21:
+                    if f == return_f:
+                        is_due_return_week = True
+                    elif f > return_f:
+                        assigned_since = any(return_f <= w < f for w in assigned_by_doc.get(cand, []))
+                        if not assigned_since and return_f in unassigned:
+                            pending_earlier_due_return = True
+        return pending_earlier_due_return, is_due_return_week
+
     # --- A-WEEK ASSIGNMENT ENGINE: MOST-CONSTRAINED FIRST + BACKTRACKING ---
     def week_start_for_a_gap(d_date):
         return d_date - timedelta(days=(d_date.weekday() - 4) % 7)
@@ -369,7 +386,11 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
     master_order = {ini: idx for idx, ini in enumerate(master_a_seq)}
     last_b_anchor = {ini: week_start_for_a_gap(dt) for ini, dt in hist_last_b_week.items() if ini in active_initials and dt}
 
+    assigned_by_doc = {ini: [] for ini in active_initials}
+    unassigned = set()
+
     def solve_a_weeks(min_gap_days):
+        nonlocal assigned_by_doc, unassigned
         assigned = {}
         assigned_by_doc = {ini: [] for ini in active_initials}
         local_a_counts = sim_a_counts.copy()
@@ -381,18 +402,15 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
         for f in c_fs:
             if temp[f]['locked']:
                 locked_doc = temp[f]['doc']
-                if locked_doc not in active_initials:
-                    continue
+                if locked_doc not in active_initials: continue
                 conflict = any(abs((f - prev_f).days) < min_gap_days for prev_f in assigned_by_doc.setdefault(locked_doc, []))
-                if conflict:
-                    return None
+                if conflict: return None
                 assigned[f] = locked_doc
                 assigned_by_doc[locked_doc].append(f)
                 local_a_counts[locked_doc] += 7
                 if week_has_bh(f):
                     bg = get_week_bh_group(f)
-                    if bg:
-                        local_bh_groups[locked_doc].add(bg)
+                    if bg: local_bh_groups[locked_doc].add(bg)
 
         unassigned = {f for f in c_fs if f not in assigned and not temp[f]['locked']}
 
@@ -422,39 +440,30 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
 
             future_pressure = 0
             for other_f in unassigned:
-                if other_f == f: continue
+                if other_f == f:
+                    continue
                 remaining = 0
                 for other_cand in week_base_candidates.get(other_f, []):
-                    if other_cand == cand: continue
+                    if other_cand == cand:
+                        continue
                     if all(abs((other_f - prev_f).days) >= min_gap_days for prev_f in assigned_by_doc.get(other_cand, [])):
                         remaining += 1
-                if remaining == 0: future_pressure += 1000
-                elif remaining == 1: future_pressure += 10
+                if remaining == 0:
+                    future_pressure += 1000
+                elif remaining == 1:
+                    future_pressure += 10
 
-            # Genuinely Due Return Pref
-            return_pref = 1
-            for start_f, return_f in leave_blocks[cand]:
-                if return_f <= f:
-                    prev = [w for w in assigned_by_doc.get(cand, []) if w < start_f]
-                    last_a = max(prev) if prev else datetime.min.date()
-                    if (start_f - last_a).days >= 21: # "genuinely due"
-                        if f == return_f: return_pref = 0
-                        elif f > return_f:
-                            assigned_since = any(return_f <= w < f for w in assigned_by_doc.get(cand, []))
-                            if not assigned_since and return_f in unassigned: return_pref = 2
-                            
-            return_skip_pen = 1 if return_pref == 2 else 0
-            leave_return_tier = 0 if return_pref == 0 else 1
+            pending_earlier_due_return, is_due_return_week = leave_return_flags(cand, f)
+            return_skip_pen = 1 if pending_earlier_due_return else 0
+            leave_return_tier = 0 if is_due_return_week else 1
 
             last_b_gap = (f - last_b_anchor.get(cand, datetime.min.date())).days if cand in last_b_anchor else 9999
             
-            # Neutralize sacrifice_bonus if the candidate is fully rested (>= 28 days)
             if gap_tier == 1:
                 sacrifice_bonus = 0 if 0 <= last_b_gap <= 14 else 1
             else:
                 sacrifice_bonus = 1
 
-            # Absolute Rest Tie-Breaker: Prioritize the person waiting the longest
             if prev_weeks:
                 last_a_overall = max([w for w in prev_weeks if w < f], default=datetime.min.date())
                 absolute_rest_days = -(f - last_a_overall).days if last_a_overall != datetime.min.date() else -9999
@@ -463,8 +472,17 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
 
             fairness = local_a_counts[cand] / fte_a_map[cand]
             rota_order = master_order.get(cand, 9999)
-            
-            return (gap_tier, future_pressure, return_skip_pen, leave_return_tier, sacrifice_bonus, absolute_rest_days, fairness, rota_order)
+
+            return (
+                gap_tier,
+                future_pressure,
+                return_skip_pen,
+                leave_return_tier,
+                sacrifice_bonus,
+                absolute_rest_days,
+                fairness,
+                rota_order
+            )
 
         def dfs():
             if not unassigned: return True
@@ -550,6 +568,10 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
 
     sim_b_counts = {ini: counts[ini]["B_days"] for ini in active_initials}
     sim_n_counts = {ini: counts[ini]["Nights"] for ini in active_initials}
+    
+    for ini in active_initials:
+        if sim_b_counts[ini] == 0: sim_b_counts[ini] = base_b
+        if sim_n_counts[ini] == 0: sim_n_counts[ini] = base_n
 
     def add_score(doc_ini, s_type, d_date):
         if doc_ini and doc_ini in period_counts:
@@ -730,13 +752,22 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
         curr_d += timedelta(days=1)
 
     state = {"A_MASTER_SEQ": ",".join(master_a_seq), "B_QUEUE": ",".join(active_initials), "CURRENT_A": final_cur_a or "", "CURRENT_B": final_cur_b or ""}
-    summ = [{"Initials": k, "Period A": period_counts[k]["A_days"], "Period B": period_counts[k]["B_days"], "Period Nights": period_counts[k]["Nights"], "Period Total (A+N)": period_counts[k]["A_days"] + period_counts[k]["Nights"], "YTD A": counts[k]["A_days"], "YTD B": counts[k]["B_days"], "YTD Nights": counts[k]["Nights"], "YTD Total (A+N)": counts[k]["A_days"] + counts[k]["Nights"], "YTD BH": counts[k]["BH_days"]} for k in active_initials]
     
-    for row in summ:
-        ini = row["Initials"]
-        if hist_counts.get(ini, {}).get("B_days", 0) == 0 and row["YTD B"] >= base_b: row["YTD B"] -= base_b
-        if hist_counts.get(ini, {}).get("Nights", 0) == 0 and row["YTD Nights"] >= base_n: row["YTD Nights"] -= base_n
-
+    summ = [{
+        "Initials": k, 
+        "FTE A": fte_a_map[k],
+        "FTE B": fte_b_map[k],
+        "Period A": period_counts[k]["A_days"], 
+        "Period B": period_counts[k]["B_days"], 
+        "Period Nights": period_counts[k]["Nights"], 
+        "Period Total (A+N)": period_counts[k]["A_days"] + period_counts[k]["Nights"], 
+        "YTD A": counts[k]["A_days"], 
+        "YTD B": counts[k]["B_days"], 
+        "YTD Nights": counts[k]["Nights"], 
+        "YTD Total (A+N)": counts[k]["A_days"] + counts[k]["Nights"], 
+        "YTD BH": counts[k]["BH_days"]
+    } for k in active_initials]
+    
     return pd.DataFrame(rota_data), pd.DataFrame(summ), state
 
 def main():
