@@ -522,6 +522,7 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
 
     sim_b_counts = {ini: counts[ini]["B_days"] for ini in active_initials}
     sim_n_counts = {ini: counts[ini]["Nights"] for ini in active_initials}
+    b_seed_counts = sim_b_counts.copy()
 
     def add_score(doc_ini, s_type, d_date):
         if doc_ini and doc_ini in period_counts:
@@ -534,6 +535,67 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
 
     norm_b = lambda x: sim_b_counts[x] / fte_b_map[x]
     norm_n = lambda x: sim_n_counts[x] / fte_a_map[x]
+
+    # --- FAIRNESS TARGETS FOR B SHIFTS ---
+    def is_b_day_eligible(d_date, ini, current_a=None):
+        if d_date.weekday() not in B_WORK_DAYS:
+            return False
+        if uk_holidays is not None and d_date in uk_holidays and d_date.weekday() < 5:
+            return False
+        if is_b_manual_period(d_date):
+            return False
+
+        marker = get_eff_marker(d_date, ini)
+        if marker in ["AL", "SL", "NO", "OFF", "DIL", "REQ", "REQB"]:
+            return False
+        if current_a and ini == current_a:
+            return False
+        return True
+
+    b_capacity = {ini: 0.0 for ini in active_initials}
+
+    scan_d = curr_d_start
+    while scan_d <= fin_d:
+        if scan_d.weekday() in B_WORK_DAYS:
+            if not (uk_holidays is not None and scan_d in uk_holidays and scan_d.weekday() < 5):
+                if not is_b_manual_period(scan_d):
+                    for ini in active_initials:
+                        marker = get_eff_marker(scan_d, ini)
+                        if marker not in ["AL", "SL", "NO", "OFF", "DIL", "REQ", "REQB"]:
+                            b_capacity[ini] += fte_b_map[ini]
+        scan_d += timedelta(days=1)
+
+    total_capacity = sum(b_capacity.values()) if b_capacity else 0.0
+    target_share_b = {
+        ini: (b_capacity[ini] / total_capacity) if total_capacity > 0 else (1.0 / max(1, len(active_initials)))
+        for ini in active_initials
+    }
+
+    def elapsed_b_slots_until(d_date):
+        n = 0
+        t = curr_d_start
+        while t <= min(d_date, fin_d):
+            if t.weekday() in B_WORK_DAYS:
+                if not (uk_holidays is not None and t in uk_holidays and t.weekday() < 5):
+                    if not is_b_manual_period(t):
+                        n += 1
+            t += timedelta(days=1)
+        return n
+
+    def fairness_over_target(x, d_date):
+        expected_now = b_seed_counts.get(x, 0) + (target_share_b[x] * elapsed_b_slots_until(d_date))
+        actual_now = sim_b_counts[x]
+        return max(0.0, actual_now - expected_now)
+
+    def fairness_under_target(x, d_date):
+        expected_now = b_seed_counts.get(x, 0) + (target_share_b[x] * elapsed_b_slots_until(d_date))
+        actual_now = sim_b_counts[x]
+        return max(0.0, expected_now - actual_now)
+
+    def projected_runaway(x, d_date, extra_days=1):
+        expected_now = b_seed_counts.get(x, 0) + (target_share_b[x] * elapsed_b_slots_until(d_date))
+        projected = sim_b_counts[x] + extra_days
+        return 1 if projected > (expected_now + 2.0) else 0
 
     def b_penalty(doc, d_date):
         past_a = [f for f, cand in cycle_a_schedule.items() if cand == doc and f <= d_date]
@@ -580,7 +642,6 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
 
             blocked_count = sum(1 for c in active_initials if is_blocked_for_week(curr_d, c))
             high_leave_mode = blocked_count >= 4
-            avg_b = sum(sim_b_counts.values()) / len(sim_b_counts) if sim_b_counts else 0
 
             if wd == 0 or cur_b is None or cur_b == "UNCOVERED":
                 if man_b: 
@@ -588,43 +649,46 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
                 else:
                     avail_week = [c for c in active_initials if c != cur_a and not is_blocked_for_week(curr_d, c)]
                     if avail_week:
-                        def week_score(x):
-                            # Strict priority order for normal weeks:
-                            # 1) prevent 5-shift runaway
-                            # 2) preserve Solid/Neuro pairing
-                            # 3) avoid back-to-back B weeks
-                            # 4) avoid B-after-A where possible
-                            # 5) fairness only as final tie-breaker
-                            CEILING_W = 10000.0
-                            GROUP_W = 100.0
-                            BB_W = 10.0
-                            PBOX_W_NORMAL = 1.0
-                            PBOX_W_CRISIS = 0.25
-                            FAIRNESS_SCALE = 1000.0
+                        fair_candidates = [x for x in avail_week if fairness_over_target(x, curr_d) < 1.5]
+                        if fair_candidates:
+                            avail_week = fair_candidates
 
-                            p_box = b_penalty(x, curr_d)
+                        def week_score(x):
                             g_pen = group_penalty(cur_a, x)
                             bb_pen = 1 if (curr_d - last_b_week_start.get(x, datetime.min.date())).days <= 14 else 0
-                            ceiling_pen = 1 if (sim_b_counts[x] - avg_b) >= 5 else 0
+                            p_box = b_penalty(x, curr_d)
 
-                            p_box_weight = PBOX_W_CRISIS if high_leave_mode else PBOX_W_NORMAL
-                            fairness_component = norm_b(x)
+                            # crisis week: only soften B-after-A, not coupling or fairness
+                            p_box_effective = 0 if high_leave_mode else p_box
 
-                            score = (
-                                ceiling_pen * CEILING_W
-                                + g_pen * GROUP_W
-                                + bb_pen * BB_W
-                                + p_box * p_box_weight
-                                + (fairness_component / FAIRNESS_SCALE)
+                            # a Monday choice usually drives most of the week, so assess as ~4 B-days
+                            runaway = projected_runaway(x, curr_d, extra_days=4)
+                            fair_over = round(fairness_over_target(x, curr_d), 3)
+                            fair_under = round(fairness_under_target(x, curr_d), 3)
+
+                            # strict hierarchy:
+                            # 1 runaway
+                            # 2 fairness over target
+                            # 3 group coupling
+                            # 4 back-to-back B week
+                            # 5 B-after-A
+                            # 6 prefer under-target people as tie-break
+                            # 7 stable final tie-break
+                            return (
+                                runaway,
+                                fair_over,
+                                g_pen,
+                                bb_pen,
+                                p_box_effective,
+                                -fair_under,
+                                x
                             )
-                            return score
-                            
+
                         cur_b = min(avail_week, key=week_score)
                         if cur_b != "UNCOVERED":
                             last_b_week_start[cur_b] = curr_d
                     else:
                         cur_b = "UNCOVERED"
-
             rq_d = next((i for i in active_initials if get_eff_marker(curr_d, i) == "REQ"), None)
             rqb_d = next((i for i in active_initials if get_eff_marker(curr_d, i) == "REQB"), None)
             lc_d = locum_dict.get(curr_d)
@@ -655,44 +719,39 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
                         avail = [i for i in active_initials if i not in [da_i, cur_b] and get_eff_marker(curr_d, i) not in ["AL", "SL", "NO", "OFF", "DIL", "REQ", "REQB"]]
                         if avail:
                             def daily_score(x):
-                                # Strict priority order for normal weeks:
-                                # 1) prevent 5-shift runaway
-                                # 2) preserve Solid/Neuro pairing
-                                # 3) avoid back-to-back B days
-                                # 4) avoid B-after-A where possible
-                                # 5) fairness only as final tie-breaker
-                                CEILING_W = 10000.0
-                                GROUP_W = 100.0
-                                BB_W = 10.0
-                                PBOX_W_NORMAL = 1.0
-                                PBOX_W_CRISIS = 0.25
-                                FAIRNESS_SCALE = 1000.0
-                                DIL_BONUS = 0.01
-
-                                p_box = b_penalty(x, curr_d)
                                 g_pen = group_penalty(da_i, x)
                                 recent_b = (curr_d - recent_b_shifts.get(x, datetime.min.date())).days
                                 bb_pen = 1 if recent_b < 7 else 0
-                                ceiling_pen = 1 if (sim_b_counts[x] - avg_b) >= 5 else 0
+                                p_box = b_penalty(x, curr_d)
 
-                                p_box_weight = PBOX_W_CRISIS if high_leave_mode else PBOX_W_NORMAL
-                                fairness_component = norm_b(x) + (norm_n(x) if wd in active_b_nights else 0)
+                                # crisis week: only soften B-after-A
+                                p_box_effective = 0 if high_leave_mode else p_box
 
-                                score = (
-                                    ceiling_pen * CEILING_W
-                                    + g_pen * GROUP_W
-                                    + bb_pen * BB_W
-                                    + p_box * p_box_weight
-                                    + (fairness_component / FAIRNESS_SCALE)
-                                )
+                                runaway = projected_runaway(x, curr_d, extra_days=1)
+                                fair_over = round(fairness_over_target(x, curr_d), 3)
+                                fair_under = round(fairness_under_target(x, curr_d), 3)
 
+                                # tiny tie-break for B-night balancing only
+                                night_bias = round(norm_n(x), 3) if wd in active_b_nights else 0.0
+
+                                dil_bonus = 0
                                 if wd in active_b_nights:
                                     other_b_nights = [n for n in active_b_nights if n != wd]
                                     x_dil = d_map.get(x)
                                     if x_dil and x_dil in DAY_NAMES and DAY_NAMES.index(x_dil) in other_b_nights:
-                                        score -= DIL_BONUS
+                                        dil_bonus = 1
 
-                                return score
+                                return (
+                                    runaway,
+                                    fair_over,
+                                    g_pen,
+                                    bb_pen,
+                                    p_box_effective,
+                                    -fair_under,
+                                    night_bias,
+                                    -dil_bonus,
+                                    x
+                                )
 
                             best = min(avail, key=daily_score)
                             row["Consultant B"] = name_map.get(best)
