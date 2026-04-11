@@ -229,7 +229,7 @@ def get_group(doc_ini):
 def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist_master_a, hist_cycle_a, hist_b_q, hist_curr_a, hist_curr_b, hist_last_a_dates, locum_dict, hist_b_dates, ytd_s, ytd_e, hist_last_b_week):
     active_initials = [safe_ini(c.get('Initials')) for c in consultants if c.get('Active', True) and safe_ini(c.get('Initials'))]
     name_map = {safe_ini(c.get('Initials')): c.get('Full Name', '') for c in consultants if safe_ini(c.get('Initials'))}
-    
+
     def safe_float(val, default=1.0):
         try:
             f = float(val)
@@ -259,8 +259,10 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
         ts = pd.Timestamp(d_date).normalize()
         if not leave_df.empty and ts in leave_df.index and ini in leave_df.columns:
             val = str(leave_df.loc[ts, ini]).strip().upper()
-            if val not in ["NAN", "NAT", "NONE", ""]: return val
-        if d_map.get(ini) == DAY_NAMES[d_date.weekday()]: return "DIL"
+            if val not in ["NAN", "NAT", "NONE", ""]:
+                return val
+        if d_map.get(ini) == DAY_NAMES[d_date.weekday()]:
+            return "DIL"
         return ""
 
     def is_blocked_for_week(d_date, ini):
@@ -274,7 +276,8 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
     def sync(h, a):
         nl = [i for i in h if i in a]
         for i in a:
-            if i not in nl: nl.append(i)
+            if i not in nl:
+                nl.append(i)
         return nl
 
     if hist_master_a:
@@ -284,25 +287,30 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
         neuros = [i for i in active_initials if group_map.get(i) == "Neuro"]
         others = [i for i in active_initials if group_map.get(i) not in ["Solid", "Neuro"]]
         random.seed()
-        random.shuffle(solids); random.shuffle(neuros); random.shuffle(others)
+        random.shuffle(solids)
+        random.shuffle(neuros)
+        random.shuffle(others)
         master_a_seq = []
         while solids or neuros or others:
-            if solids: master_a_seq.append(solids.pop(0))
-            if neuros: master_a_seq.append(neuros.pop(0))
-            if others: master_a_seq.append(others.pop(0))
+            if solids:
+                master_a_seq.append(solids.pop(0))
+            if neuros:
+                master_a_seq.append(neuros.pop(0))
+            if others:
+                master_a_seq.append(others.pop(0))
 
     start_anc = curr_d_start - timedelta(days=(curr_d_start.weekday() - 4) % 7)
-    
+
     cycle_a_schedule = {k: v for k, v in hist_cycle_a.items() if k < start_anc}
     last_a_end = {k: v for k, v in hist_last_a_dates.items() if v < start_anc}
 
     c_fs = []
     chk = start_anc
     while chk <= fin_d:
-        if not any(locum_dict.get(chk + timedelta(days=o)) for o in range(7)): 
+        if not any(locum_dict.get(chk + timedelta(days=o)) for o in range(7)):
             c_fs.append(chk)
         chk += timedelta(days=7)
-    
+
     temp = {f: {'doc': None, 'locked': False} for f in c_fs}
     for f in c_fs:
         for doc in active_initials:
@@ -312,15 +320,18 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
 
     sim_a_counts = {ini: hist_counts.get(ini, {}).get("A_days", 0) for ini in active_initials}
     for ini in active_initials:
-        if sim_a_counts[ini] == 0: 
+        if sim_a_counts[ini] == 0:
             others_a = [v for v in sim_a_counts.values() if v > 0]
             sim_a_counts[ini] = min(others_a) if others_a else 0
 
     sim_bh_groups = {ini: set(hist_counts.get(ini, {}).get("BH_groups", set())) for ini in active_initials}
-    
+
     def week_has_bh(slot_f):
-        return any(uk_holidays is not None and (slot_f + timedelta(days=i)) in uk_holidays and (slot_f + timedelta(days=i)).weekday() < 5 for i in range(7))
-        
+        return any(
+            uk_holidays is not None and (slot_f + timedelta(days=i)) in uk_holidays and (slot_f + timedelta(days=i)).weekday() < 5
+            for i in range(7)
+        )
+
     def get_week_bh_group(slot_f):
         for i in range(7):
             d = slot_f + timedelta(days=i)
@@ -332,13 +343,16 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
     def week_start_for_a_gap(d_date):
         return d_date - timedelta(days=(d_date.weekday() - 4) % 7)
 
+    def is_a_week_blocked(anchor_f, cand):
+        return any(get_eff_marker(anchor_f + timedelta(days=o), cand) in ["AL", "SL", "NO", "OFF"] for o in range(7))
+
     week_base_candidates = {}
     week_block_counts = {}
     for f in c_fs:
         base_cands = []
         blocked = 0
         for cand in active_initials:
-            if any(get_eff_marker(f + timedelta(days=o), cand) in ["AL", "SL", "NO", "OFF"] for o in range(7)):
+            if is_a_week_blocked(f, cand):
                 blocked += 1
             else:
                 base_cands.append(cand)
@@ -352,6 +366,38 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
 
     master_order = {ini: idx for idx, ini in enumerate(master_a_seq)}
     last_b_anchor = {ini: week_start_for_a_gap(dt) for ini, dt in hist_last_b_week.items() if ini in active_initials and dt}
+
+    # Prefer the first eligible Friday back after a long blocked run, but only if the consultant is genuinely due.
+    lookback_anc = start_anc - timedelta(days=84)
+    all_anchors = []
+    anc = lookback_anc
+    while anc <= fin_d:
+        all_anchors.append(anc)
+        anc += timedelta(days=7)
+
+    leave_return_rules = {ini: [] for ini in active_initials}
+    for ini in active_initials:
+        blocked_flags = [(anc, is_a_week_blocked(anc, ini)) for anc in all_anchors]
+        idx = 0
+        while idx < len(blocked_flags):
+            anc_date, is_blocked = blocked_flags[idx]
+            if not is_blocked:
+                idx += 1
+                continue
+
+            run_start = anc_date
+            run_len = 0
+            while idx < len(blocked_flags) and blocked_flags[idx][1]:
+                run_len += 1
+                idx += 1
+
+            if run_len >= 2 and idx < len(blocked_flags):
+                return_week = blocked_flags[idx][0]
+                if return_week in c_fs:
+                    leave_return_rules[ini].append({
+                        "blocked_start": run_start,
+                        "return_week": return_week
+                    })
 
     def solve_a_weeks(min_gap_days):
         assigned = {}
@@ -399,15 +445,32 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
                     best_cands = cands
             return best_week, best_cands
 
+        def leave_return_flags(cand, f):
+            pending_earlier_due_return = False
+            is_due_return_week = False
+
+            for rule in leave_return_rules.get(cand, []):
+                blocked_start = rule["blocked_start"]
+                return_week = rule["return_week"]
+
+                prior_weeks = [wk for wk in assigned_by_doc.get(cand, []) if wk < blocked_start]
+                last_before_block = max(prior_weeks) if prior_weeks else None
+
+                due = last_before_block is None or (blocked_start - last_before_block).days >= 21
+                if not due:
+                    continue
+
+                if return_week == f:
+                    is_due_return_week = True
+                elif return_week in unassigned and return_week < f:
+                    pending_earlier_due_return = True
+
+            return pending_earlier_due_return, is_due_return_week
+
         def candidate_score(cand, f):
             prev_weeks = assigned_by_doc.get(cand, [])
             closest_gap = min([abs((f - prev_f).days) for prev_f in prev_weeks], default=9999)
             gap_tier = 0 if closest_gap >= 28 else 1
-
-            # Sacrifice rule: it is preferable to use someone coming straight off a B-week
-            # than to force somebody else into a 14-day A-gap later.
-            last_b_gap = (f - last_b_anchor.get(cand, datetime.min.date())).days if cand in last_b_anchor else 9999
-            sacrifice_bonus = 0 if 0 <= last_b_gap <= 14 else 1
 
             future_pressure = 0
             for other_f in unassigned:
@@ -424,10 +487,27 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
                 elif remaining == 1:
                     future_pressure += 10
 
+            pending_earlier_due_return, is_due_return_week = leave_return_flags(cand, f)
+            return_skip_pen = 1 if pending_earlier_due_return else 0
+            leave_return_tier = 0 if is_due_return_week else 1
+
+            last_b_gap = (f - last_b_anchor.get(cand, datetime.min.date())).days if cand in last_b_anchor else 9999
+            sacrifice_bonus = 0 if 0 <= last_b_gap <= 14 else 1
+
             bh_pen = len(local_bh_groups[cand]) if week_has_bh(f) else 0
             fairness = local_a_counts[cand] / fte_a_map[cand]
             rota_order = master_order.get(cand, 9999)
-            return (gap_tier, future_pressure, sacrifice_bonus, bh_pen, fairness, rota_order)
+
+            return (
+                gap_tier,
+                future_pressure,
+                return_skip_pen,
+                leave_return_tier,
+                sacrifice_bonus,
+                bh_pen,
+                fairness,
+                rota_order
+            )
 
         def dfs():
             if not unassigned:
@@ -488,26 +568,27 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
             cycle_a_schedule[f] = "UNCOVERED"
 
     for f, info in temp.items():
-        if info['doc']: cycle_a_schedule[f] = info['doc']
-        
+        if info['doc']:
+            cycle_a_schedule[f] = info['doc']
+
     rota_data = []
     curr_d = curr_d_start
     cur_a = cycle_a_schedule.get(start_anc, "UNCOVERED") if hist_curr_a is None else hist_curr_a
     cur_b = hist_curr_b if hist_curr_b else None
-    
+
     final_cur_a = cur_a
     final_cur_b = cur_b
-    
+
     counts = {ini: {
-        "A_days": hist_counts.get(ini, {}).get("A_days", 0), 
-        "B_days": hist_counts.get(ini, {}).get("B_days", 0), 
+        "A_days": hist_counts.get(ini, {}).get("A_days", 0),
+        "B_days": hist_counts.get(ini, {}).get("B_days", 0),
         "Nights": hist_counts.get(ini, {}).get("Nights", 0),
         "BH_days": hist_counts.get(ini, {}).get("BH_days", 0),
         "BH_groups": set(hist_counts.get(ini, {}).get("BH_groups", set()))
     } for ini in active_initials}
-    
+
     period_counts = {ini: {"A_days": 0, "B_days": 0, "Nights": 0, "BH_days": 0} for ini in active_initials}
-    
+
     recent_b_shifts = hist_b_dates.copy()
     last_b_week_start = hist_last_b_week.copy()
 
@@ -515,10 +596,12 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
     base_b = min([v["B_days"] for v in others_b]) if others_b else 0
     others_n = [v for v in counts.values() if v["Nights"] > 0]
     base_n = min([v["Nights"] for v in others_n]) if others_n else 0
-    
+
     for ini in active_initials:
-        if counts[ini]["B_days"] == 0: counts[ini]["B_days"] = base_b
-        if counts[ini]["Nights"] == 0: counts[ini]["Nights"] = base_n
+        if counts[ini]["B_days"] == 0:
+            counts[ini]["B_days"] = base_b
+        if counts[ini]["Nights"] == 0:
+            counts[ini]["Nights"] = base_n
 
     sim_b_counts = {ini: counts[ini]["B_days"] for ini in active_initials}
     sim_n_counts = {ini: counts[ini]["Nights"] for ini in active_initials}
@@ -529,96 +612,136 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
                 period_counts[doc_ini][s_type] += 1
             if ytd_s_d <= d_date <= ytd_e_d:
                 counts[doc_ini][s_type] += 1
-            if s_type == "B_days": sim_b_counts[doc_ini] += 1
-            if s_type == "Nights": sim_n_counts[doc_ini] += 1
+            if s_type == "B_days":
+                sim_b_counts[doc_ini] += 1
+            if s_type == "Nights":
+                sim_n_counts[doc_ini] += 1
 
-    norm_b = lambda x: sim_b_counts[x] / fte_b_map[x]
     norm_n = lambda x: sim_n_counts[x] / fte_a_map[x]
 
     def b_penalty(doc, d_date):
         past_a = [f for f, cand in cycle_a_schedule.items() if cand == doc and f <= d_date]
         if past_a:
             last_a = max(past_a)
-            # Softened to 14 days (allows B-shift 2 weeks after A-shift)
-            if (d_date - last_a).days <= 14: return 1
-            
+            if (d_date - last_a).days <= 14:
+                return 1
         for f_date, cand in cycle_a_schedule.items():
-            if cand == doc and 0 <= (f_date - d_date).days <= 14: return 1
-            
+            if cand == doc and 0 <= (f_date - d_date).days <= 14:
+                return 1
         return 0
 
     def group_penalty(a_ini, b_ini):
-        if not a_ini or not b_ini: return 0
+        if not a_ini or not b_ini:
+            return 0
         g_a = group_map.get(a_ini, "Others")
         g_b = group_map.get(b_ini, "Others")
-        if g_a == "Others" or g_b == "Others": return 0
+        if g_a == "Others" or g_b == "Others":
+            return 0
         return 1 if g_a == g_b else 0
 
-    while curr_d <= fin_d + timedelta(days=365):            
+    # --- FAIRNESS TARGETS FOR B SHIFTS ---
+    def is_b_day_eligible(d_date, ini, current_a=None):
+        if d_date.weekday() not in B_WORK_DAYS:
+            return False
+        if uk_holidays is not None and d_date in uk_holidays and d_date.weekday() < 5:
+            return False
+        if is_b_manual_period(d_date):
+            return False
+        marker = get_eff_marker(d_date, ini)
+        if marker in ["AL", "SL", "NO", "OFF", "DIL", "REQ", "REQB"]:
+            return False
+        if current_a and ini == current_a:
+            return False
+        return True
+
+    b_capacity = {ini: 0.0 for ini in active_initials}
+    scan_d = curr_d_start
+    while scan_d <= fin_d:
+        if scan_d.weekday() in B_WORK_DAYS and not (uk_holidays is not None and scan_d in uk_holidays and scan_d.weekday() < 5) and not is_b_manual_period(scan_d):
+            for ini in active_initials:
+                if is_b_day_eligible(scan_d, ini):
+                    b_capacity[ini] += fte_b_map[ini]
+        scan_d += timedelta(days=1)
+
+    total_capacity = sum(b_capacity.values()) if b_capacity else 0.0
+    target_share_b = {
+        ini: (b_capacity[ini] / total_capacity) if total_capacity > 0 else (1.0 / max(1, len(active_initials)))
+        for ini in active_initials
+    }
+
+    def elapsed_b_slots_until(d_date):
+        n = 0
+        t = curr_d_start
+        while t <= min(d_date, fin_d):
+            if t.weekday() in B_WORK_DAYS and not (uk_holidays is not None and t in uk_holidays and t.weekday() < 5) and not is_b_manual_period(t):
+                n += 1
+            t += timedelta(days=1)
+        return n
+
+    def fairness_over_target(x, d_date):
+        expected_now = hist_counts.get(x, {}).get("B_days", 0) + (target_share_b[x] * elapsed_b_slots_until(d_date))
+        actual_now = sim_b_counts[x]
+        return max(0.0, actual_now - expected_now)
+
+    def fairness_under_target(x, d_date):
+        expected_now = hist_counts.get(x, {}).get("B_days", 0) + (target_share_b[x] * elapsed_b_slots_until(d_date))
+        actual_now = sim_b_counts[x]
+        return max(0.0, expected_now - actual_now)
+
+    def projected_runaway(x, d_date, extra_days=1):
+        expected_now = hist_counts.get(x, {}).get("B_days", 0) + (target_share_b[x] * elapsed_b_slots_until(d_date))
+        projected = sim_b_counts[x] + extra_days
+        return 1 if projected > (expected_now + 2.0) else 0
+
+    while curr_d <= fin_d + timedelta(days=365):
         wd = curr_d.weekday()
-        
         row = {"Date": curr_d.strftime("%d/%m/%Y"), "Day": DAY_NAMES[wd], "Consultant A": "", "Consultant B": "", "Nights": ""}
-        
+
         if curr_d <= fin_d:
             man_b = is_b_manual_period(curr_d)
             is_bh_today = uk_holidays is not None and curr_d in uk_holidays and curr_d.weekday() < 5
-            
+
             w_start = curr_d - timedelta(days=wd)
             is_bh_week = False
             if uk_holidays is not None:
                 for d in range(5):
                     if (w_start + timedelta(days=d)) in uk_holidays:
-                        is_bh_week = True; break
+                        is_bh_week = True
+                        break
 
             active_a_nights = [0, 2, 4, 5, 6] if is_bh_week else [1, 3, 4, 5, 6]
             active_b_nights = [1, 3] if is_bh_week else [0, 2]
-            
+
             if wd == 4:
                 anc = curr_d
-                if any(locum_dict.get(anc + timedelta(days=o)) for o in range(7)): cur_a = "LOCUM_ACADEMIC"
-                else: cur_a = cycle_a_schedule.get(anc, "UNCOVERED")
+                if any(locum_dict.get(anc + timedelta(days=o)) for o in range(7)):
+                    cur_a = "LOCUM_ACADEMIC"
+                else:
+                    cur_a = cycle_a_schedule.get(anc, "UNCOVERED")
 
             blocked_count = sum(1 for c in active_initials if is_blocked_for_week(curr_d, c))
             high_leave_mode = blocked_count >= 4
-            avg_b = sum(sim_b_counts.values()) / len(sim_b_counts) if sim_b_counts else 0
 
             if wd == 0 or cur_b is None or cur_b == "UNCOVERED":
-                if man_b: 
+                if man_b:
                     cur_b = "MANUAL ENTRY"
                 else:
                     avail_week = [c for c in active_initials if c != cur_a and not is_blocked_for_week(curr_d, c)]
                     if avail_week:
-                        def week_score(x):
-                            # Strict priority order for normal weeks:
-                            # 1) prevent 5-shift runaway
-                            # 2) preserve Solid/Neuro pairing
-                            # 3) avoid back-to-back B weeks
-                            # 4) avoid B-after-A where possible
-                            # 5) fairness only as final tie-breaker
-                            CEILING_W = 10000.0
-                            GROUP_W = 100.0
-                            BB_W = 10.0
-                            PBOX_W_NORMAL = 1.0
-                            PBOX_W_CRISIS = 0.25
-                            FAIRNESS_SCALE = 1000.0
+                        fair_candidates = [x for x in avail_week if fairness_over_target(x, curr_d) < 1.5]
+                        if fair_candidates:
+                            avail_week = fair_candidates
 
-                            p_box = b_penalty(x, curr_d)
+                        def week_score(x):
                             g_pen = group_penalty(cur_a, x)
                             bb_pen = 1 if (curr_d - last_b_week_start.get(x, datetime.min.date())).days <= 14 else 0
-                            ceiling_pen = 1 if (sim_b_counts[x] - avg_b) >= 5 else 0
+                            p_box = b_penalty(x, curr_d)
+                            p_box_effective = 0 if high_leave_mode else p_box
+                            runaway = projected_runaway(x, curr_d, extra_days=4)
+                            fair_over = round(fairness_over_target(x, curr_d), 3)
+                            fair_under = round(fairness_under_target(x, curr_d), 3)
+                            return (runaway, fair_over, g_pen, bb_pen, p_box_effective, -fair_under, x)
 
-                            p_box_weight = PBOX_W_CRISIS if high_leave_mode else PBOX_W_NORMAL
-                            fairness_component = norm_b(x)
-
-                            score = (
-                                ceiling_pen * CEILING_W
-                                + g_pen * GROUP_W
-                                + bb_pen * BB_W
-                                + p_box * p_box_weight
-                                + (fairness_component / FAIRNESS_SCALE)
-                            )
-                            return score
-                            
                         cur_b = min(avail_week, key=week_score)
                         if cur_b != "UNCOVERED":
                             last_b_week_start[cur_b] = curr_d
@@ -628,22 +751,24 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
             rq_d = next((i for i in active_initials if get_eff_marker(curr_d, i) == "REQ"), None)
             rqb_d = next((i for i in active_initials if get_eff_marker(curr_d, i) == "REQB"), None)
             lc_d = locum_dict.get(curr_d)
-            
+
             da_n = lc_d if lc_d else (name_map.get(rq_d, rq_d) if rq_d else name_map.get(cur_a, cur_a))
             da_i = (cur_a if cur_a not in ["UNCOVERED", "LOCUM_ACADEMIC"] else None) if not rq_d and not lc_d else rq_d
 
             row["Consultant A"] = da_n
-            if da_i: add_score(da_i, "A_days", curr_d)
-            if wd in active_a_nights: 
+            if da_i:
+                add_score(da_i, "A_days", curr_d)
+            if wd in active_a_nights:
                 row["Nights"] = da_n
-                if da_i: add_score(da_i, "Nights", curr_d)
+                if da_i:
+                    add_score(da_i, "Nights", curr_d)
 
             if wd in B_WORK_DAYS:
                 if is_bh_today:
                     row["Consultant B"] = ""
                 elif man_b:
                     row["Consultant B"] = "MANUAL ENTRY"
-                elif rqb_d: 
+                elif rqb_d:
                     row["Consultant B"] = name_map.get(rqb_d, rqb_d)
                     add_score(rqb_d, "B_days", curr_d)
                     recent_b_shifts[rqb_d] = curr_d
@@ -655,59 +780,39 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
                         avail = [i for i in active_initials if i not in [da_i, cur_b] and get_eff_marker(curr_d, i) not in ["AL", "SL", "NO", "OFF", "DIL", "REQ", "REQB"]]
                         if avail:
                             def daily_score(x):
-                                # Strict priority order for normal weeks:
-                                # 1) prevent 5-shift runaway
-                                # 2) preserve Solid/Neuro pairing
-                                # 3) avoid back-to-back B days
-                                # 4) avoid B-after-A where possible
-                                # 5) fairness only as final tie-breaker
-                                CEILING_W = 10000.0
-                                GROUP_W = 100.0
-                                BB_W = 10.0
-                                PBOX_W_NORMAL = 1.0
-                                PBOX_W_CRISIS = 0.25
-                                FAIRNESS_SCALE = 1000.0
-                                DIL_BONUS = 0.01
-
-                                p_box = b_penalty(x, curr_d)
                                 g_pen = group_penalty(da_i, x)
                                 recent_b = (curr_d - recent_b_shifts.get(x, datetime.min.date())).days
                                 bb_pen = 1 if recent_b < 7 else 0
-                                ceiling_pen = 1 if (sim_b_counts[x] - avg_b) >= 5 else 0
-
-                                p_box_weight = PBOX_W_CRISIS if high_leave_mode else PBOX_W_NORMAL
-                                fairness_component = norm_b(x) + (norm_n(x) if wd in active_b_nights else 0)
-
-                                score = (
-                                    ceiling_pen * CEILING_W
-                                    + g_pen * GROUP_W
-                                    + bb_pen * BB_W
-                                    + p_box * p_box_weight
-                                    + (fairness_component / FAIRNESS_SCALE)
-                                )
-
+                                p_box = b_penalty(x, curr_d)
+                                p_box_effective = 0 if high_leave_mode else p_box
+                                runaway = projected_runaway(x, curr_d, extra_days=1)
+                                fair_over = round(fairness_over_target(x, curr_d), 3)
+                                fair_under = round(fairness_under_target(x, curr_d), 3)
+                                night_bias = round(norm_n(x), 3) if wd in active_b_nights else 0.0
+                                dil_bonus = 0
                                 if wd in active_b_nights:
                                     other_b_nights = [n for n in active_b_nights if n != wd]
                                     x_dil = d_map.get(x)
                                     if x_dil and x_dil in DAY_NAMES and DAY_NAMES.index(x_dil) in other_b_nights:
-                                        score -= DIL_BONUS
-
-                                return score
+                                        dil_bonus = 1
+                                return (runaway, fair_over, g_pen, bb_pen, p_box_effective, -fair_under, night_bias, -dil_bonus, x)
 
                             best = min(avail, key=daily_score)
                             row["Consultant B"] = name_map.get(best)
                             add_score(best, "B_days", curr_d)
                             recent_b_shifts[best] = curr_d
-                        else: row["Consultant B"] = "UNCOVERED"
-                    else: 
+                        else:
+                            row["Consultant B"] = "UNCOVERED"
+                    else:
                         row["Consultant B"] = name_map.get(cur_b, "UNCOVERED")
                         add_score(cur_b, "B_days", curr_d)
                         recent_b_shifts[cur_b] = curr_d
-                    
+
                     if wd in active_b_nights:
                         row["Nights"] = row["Consultant B"]
                         b_ini = next((k for k, v in name_map.items() if v == row["Consultant B"]), None)
-                        if b_ini: add_score(b_ini, "Nights", curr_d)
+                        if b_ini:
+                            add_score(b_ini, "Nights", curr_d)
 
             if is_bh_today:
                 b_ini = next((k for k, v in name_map.items() if v == row["Consultant B"]), None)
@@ -718,22 +823,25 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
                             period_counts[ini]["BH_days"] += 1
                         if ytd_s_d <= curr_d <= ytd_e_d:
                             counts[ini]["BH_days"] += 1
-                            if bh_grp: counts[ini]["BH_groups"].add(bh_grp)
+                            if bh_grp:
+                                counts[ini]["BH_groups"].add(bh_grp)
 
-            if da_i: last_a_end[da_i] = curr_d
-            
+            if da_i:
+                last_a_end[da_i] = curr_d
+
             if curr_d == fin_d:
                 final_cur_a = cur_a
                 final_cur_b = cur_b
 
-        for i in active_initials: row[i] = get_eff_marker(curr_d, i)
+        for i in active_initials:
+            row[i] = get_eff_marker(curr_d, i)
         rota_data.append(row)
         curr_d += timedelta(days=1)
 
     state = {"A_MASTER_SEQ": ",".join(master_a_seq), "B_QUEUE": ",".join(active_initials), "CURRENT_A": final_cur_a or "", "CURRENT_B": final_cur_b or ""}
-    
+
     summ = [{"Initials": k, "Period A": period_counts[k]["A_days"], "Period B": period_counts[k]["B_days"], "Period Nights": period_counts[k]["Nights"], "Period Total (A+N)": period_counts[k]["A_days"] + period_counts[k]["Nights"], "YTD A": counts[k]["A_days"], "YTD B": counts[k]["B_days"], "YTD Nights": counts[k]["Nights"], "YTD Total (A+N)": counts[k]["A_days"] + counts[k]["Nights"], "YTD BH": counts[k]["BH_days"]} for k in active_initials]
-    
+
     for row in summ:
         ini = row["Initials"]
         if hist_counts.get(ini, {}).get("B_days", 0) == 0 and row["YTD B"] >= base_b:
