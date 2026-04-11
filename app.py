@@ -433,6 +433,7 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
                     best_cands = cands
             return best_week, best_cands
 
+        # UPDATED LEXICOGRAPHICAL TUPLE LOGIC
         def candidate_score(cand, f):
             prev_weeks = assigned_by_doc.get(cand, [])
             closest_gap = min([abs((f - prev_f).days) for prev_f in prev_weeks], default=9999)
@@ -459,10 +460,13 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
 
             last_b_gap = (f - last_b_anchor.get(cand, datetime.min.date())).days if cand in last_b_anchor else 9999
             
+            # Neutralize sacrifice_bonus if the candidate is fully rested (>= 28 days)
             if gap_tier == 1:
                 sacrifice_bonus = 0 if 0 <= last_b_gap <= 14 else 1
             else:
                 sacrifice_bonus = 1
+
+            bh_pen = len(local_bh_groups[cand]) if week_has_bh(f) else 0
 
             if prev_weeks:
                 last_a_overall = max([w for w in prev_weeks if w < f], default=datetime.min.date())
@@ -479,8 +483,9 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
                 return_skip_pen,
                 leave_return_tier,
                 sacrifice_bonus,
+                bh_pen,
+                int(fairness), # FTE Fairness dominates wait time
                 absolute_rest_days,
-                fairness,
                 rota_order
             )
 
@@ -568,25 +573,28 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
 
     sim_b_counts = {ini: counts[ini]["B_days"] for ini in active_initials}
     sim_n_counts = {ini: counts[ini]["Nights"] for ini in active_initials}
-    
-    for ini in active_initials:
-        if sim_b_counts[ini] == 0: sim_b_counts[ini] = base_b
-        if sim_n_counts[ini] == 0: sim_n_counts[ini] = base_n
 
     def add_score(doc_ini, s_type, d_date):
         if doc_ini and doc_ini in period_counts:
-            if curr_d_start <= d_date <= fin_d: period_counts[doc_ini][s_type] += 1
-            if ytd_s_d <= d_date <= ytd_e_d: counts[doc_ini][s_type] += 1
+            if curr_d_start <= d_date <= fin_d:
+                period_counts[doc_ini][s_type] += 1
+            if ytd_s_d <= d_date <= ytd_e_d:
+                counts[doc_ini][s_type] += 1
             if s_type == "B_days": sim_b_counts[doc_ini] += 1
             if s_type == "Nights": sim_n_counts[doc_ini] += 1
+
+    norm_b = lambda x: sim_b_counts[x] / fte_b_map[x]
+    norm_n = lambda x: sim_n_counts[x] / fte_a_map[x]
 
     def b_penalty(doc, d_date):
         past_a = [f for f, cand in cycle_a_schedule.items() if cand == doc and f <= d_date]
         if past_a:
             last_a = max(past_a)
             if (d_date - last_a).days <= 14: return 1
+            
         for f_date, cand in cycle_a_schedule.items():
             if cand == doc and 0 <= (f_date - d_date).days <= 14: return 1
+            
         return 0
 
     def group_penalty(a_ini, b_ini):
@@ -622,6 +630,7 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
 
     while curr_d <= fin_d + timedelta(days=365):            
         wd = curr_d.weekday()
+        
         row = {"Date": curr_d.strftime("%d/%m/%Y"), "Day": DAY_NAMES[wd], "Consultant A": "", "Consultant B": "", "Nights": ""}
         
         if curr_d <= fin_d:
@@ -645,6 +654,7 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
 
             blocked_count = sum(1 for c in active_initials if is_blocked_for_week(curr_d, c))
             high_leave_mode = blocked_count >= 4
+            avg_b = sum(sim_b_counts.values()) / len(sim_b_counts) if sim_b_counts else 0
 
             if wd == 0 or cur_b is None or cur_b == "UNCOVERED":
                 if man_b: 
@@ -738,14 +748,17 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
                 bh_grp = get_bh_group(curr_d)
                 for ini in [da_i, b_ini]:
                     if ini and ini in period_counts:
-                        if curr_d_start <= curr_d <= fin_d: period_counts[ini]["BH_days"] += 1
+                        if curr_d_start <= curr_d <= fin_d:
+                            period_counts[ini]["BH_days"] += 1
                         if ytd_s_d <= curr_d <= ytd_e_d:
                             counts[ini]["BH_days"] += 1
                             if bh_grp: counts[ini]["BH_groups"].add(bh_grp)
 
             if da_i: last_a_end[da_i] = curr_d
+            
             if curr_d == fin_d:
-                final_cur_a, final_cur_b = cur_a, cur_b
+                final_cur_a = cur_a
+                final_cur_b = cur_b
 
         for i in active_initials: row[i] = get_eff_marker(curr_d, i)
         rota_data.append(row)
@@ -768,6 +781,13 @@ def generate_rota(leave_df, consultants, start_date, end_date, hist_counts, hist
         "YTD BH": counts[k]["BH_days"]
     } for k in active_initials]
     
+    for row in summ:
+        ini = row["Initials"]
+        if hist_counts.get(ini, {}).get("B_days", 0) == 0 and row["YTD B"] >= base_b:
+            row["YTD B"] -= base_b
+        if hist_counts.get(ini, {}).get("Nights", 0) == 0 and row["YTD Nights"] >= base_n:
+            row["YTD Nights"] -= base_n
+
     return pd.DataFrame(rota_data), pd.DataFrame(summ), state
 
 def main():
